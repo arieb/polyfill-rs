@@ -815,6 +815,7 @@ pub struct PriceChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceChangeEntry {
     pub asset_id: String,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub price: Decimal,
     #[serde(
         default,
@@ -852,6 +853,7 @@ pub struct TickSizeChange {
 pub struct LastTradePrice {
     pub asset_id: String,
     pub market: String,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub price: Decimal,
     #[serde(default)]
     pub side: Option<Side>,
@@ -874,8 +876,11 @@ pub struct LastTradePrice {
 pub struct BestBidAsk {
     pub market: String,
     pub asset_id: String,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub best_bid: Decimal,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub best_ask: Decimal,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub spread: Decimal,
     #[serde(deserialize_with = "crate::decode::deserializers::number_from_string")]
     pub timestamp: u64,
@@ -945,7 +950,9 @@ pub struct TradeMessage {
     pub market: String,
     pub asset_id: String,
     pub side: Side,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub size: Decimal,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub price: Decimal,
     /// Trade lifecycle status (Matched → Mined → Confirmed).
     #[serde(default)]
@@ -1007,6 +1014,7 @@ pub struct OrderMessage {
     pub market: String,
     pub asset_id: String,
     pub side: Side,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub price: Decimal,
     #[serde(rename = "type", default)]
     pub msg_type: Option<String>,
