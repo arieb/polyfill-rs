@@ -100,6 +100,22 @@ struct ClientAuthConfig {
     funder: Option<Address>,
 }
 
+/// Check HTTP status before JSON parse. Returns PolyfillError::Api on non-2xx.
+async fn check_and_parse<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T> {
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(PolyfillError::api(status, format!("{context}: {body}")));
+    }
+    response
+        .json::<T>()
+        .await
+        .map_err(|e| PolyfillError::parse(format!("Failed to parse {context}: {e}"), None))
+}
+
 impl ClobClient {
     fn build_client(
         host: &str,
@@ -1324,15 +1340,11 @@ impl ClobClient {
                 .into_iter()
                 .fold(req, |r, (k, v)| r.header(HeaderName::from_static(k), v));
 
-            let resp = r
+            let response = r
                 .send()
                 .await
-                .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?
-                .json::<Value>()
-                .await
-                .map_err(|e| {
-                    PolyfillError::parse(format!("Failed to parse response: {}", e), None)
-                })?;
+                .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
+            let resp = check_and_parse::<Value>(response, "get_orders").await?;
 
             let new_cursor = resp["next_cursor"]
                 .as_str()
@@ -1407,15 +1419,11 @@ impl ClobClient {
                 .into_iter()
                 .fold(req, |r, (k, v)| r.header(HeaderName::from_static(k), v));
 
-            let resp = r
+            let response = r
                 .send()
                 .await
-                .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?
-                .json::<Value>()
-                .await
-                .map_err(|e| {
-                    PolyfillError::parse(format!("Failed to parse response: {}", e), None)
-                })?;
+                .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
+            let resp = check_and_parse::<Value>(response, "get_trades").await?;
 
             let new_cursor = resp["next_cursor"]
                 .as_str()
@@ -1484,10 +1492,7 @@ impl ClobClient {
             .await
             .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
 
-        response
-            .json::<Value>()
-            .await
-            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))
+        check_and_parse::<Value>(response, "get_balance_allowance").await
     }
 
     /// Set up notifications for order fills and other events
@@ -1673,10 +1678,7 @@ impl ClobClient {
             .await
             .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
 
-        response
-            .json::<crate::types::OpenOrder>()
-            .await
-            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))
+        check_and_parse::<crate::types::OpenOrder>(response, "get_order").await
     }
 
     /// Get last trade price for a token
@@ -2409,10 +2411,7 @@ impl ClobClient {
             .await
             .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
 
-        response
-            .json::<crate::types::Market>()
-            .await
-            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))
+        check_and_parse::<crate::types::Market>(response, "get_market").await
     }
 
     /// Get market trades events
