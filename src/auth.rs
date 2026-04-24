@@ -5,7 +5,7 @@
 
 use crate::errors::{PolyfillError, Result};
 use crate::types::ApiCredentials;
-use alloy_primitives::{hex::encode_prefixed, Address, U256};
+use alloy_primitives::{hex::encode_prefixed, Address, B256, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{eip712_domain, sol};
@@ -42,16 +42,32 @@ sol! {
         uint256 salt;
         address maker;
         address signer;
-        address taker;
         uint256 tokenId;
         uint256 makerAmount;
         uint256 takerAmount;
-        uint256 expiration;
-        uint256 nonce;
-        uint256 feeRateBps;
         uint8 side;
         uint8 signatureType;
+        uint256 timestamp;
+        bytes32 metadata;
+        bytes32 builder;
     }
+}
+
+/// V2 order signing payload. The REST body still carries `expiration`, but the EIP-712 payload
+/// follows the V2 exchange struct.
+#[derive(Clone)]
+pub struct SignedOrderMessage {
+    pub salt: U256,
+    pub maker: Address,
+    pub signer: Address,
+    pub token_id: U256,
+    pub maker_amount: U256,
+    pub taker_amount: U256,
+    pub side: u8,
+    pub signature_type: u8,
+    pub timestamp: U256,
+    pub metadata: B256,
+    pub builder: B256,
 }
 
 /// Get current Unix timestamp in seconds
@@ -94,13 +110,27 @@ pub fn sign_clob_auth_message(
 /// Sign order message using EIP-712
 pub fn sign_order_message(
     signer: &PrivateKeySigner,
-    order: Order,
+    order: SignedOrderMessage,
     chain_id: u64,
     verifying_contract: Address,
 ) -> Result<String> {
+    let order = Order {
+        salt: order.salt,
+        maker: order.maker,
+        signer: order.signer,
+        tokenId: order.token_id,
+        makerAmount: order.maker_amount,
+        takerAmount: order.taker_amount,
+        side: order.side,
+        signatureType: order.signature_type,
+        timestamp: order.timestamp,
+        metadata: order.metadata,
+        builder: order.builder,
+    };
+
     let domain = eip712_domain!(
         name: "Polymarket CTF Exchange",
-        version: "1",
+        version: "2",
         chain_id: chain_id,
         verifying_contract: verifying_contract,
     );
@@ -335,7 +365,7 @@ mod tests {
             passphrase: "test_passphrase".to_string(),
         };
 
-        let result = create_l2_headers::<String>(&signer, &api_creds, "/test", "GET", None);
+        let result = create_l2_headers::<String>(&signer, &api_creds, "GET", "/test", None);
         assert!(result.is_ok());
 
         let headers = result.unwrap();

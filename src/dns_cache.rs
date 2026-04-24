@@ -105,7 +105,7 @@ mod tests {
     #[ignore = "requires external DNS/network access"]
     async fn test_dns_cache_resolve() {
         let cache = DnsCache::new().await.unwrap();
-        let ips = cache.resolve("clob.polymarket.com").await.unwrap();
+        let ips = cache.resolve("clob-v2.polymarket.com").await.unwrap();
         assert!(!ips.is_empty());
     }
 
@@ -113,7 +113,7 @@ mod tests {
     #[ignore = "requires external DNS/network access"]
     async fn test_dns_cache_prewarm() {
         let cache = DnsCache::new().await.unwrap();
-        cache.prewarm("clob.polymarket.com").await.unwrap();
+        cache.prewarm("clob-v2.polymarket.com").await.unwrap();
         assert_eq!(cache.cache_size().await, 1);
     }
 
@@ -121,7 +121,7 @@ mod tests {
     #[ignore = "requires external DNS/network access"]
     async fn test_dns_cache_clear() {
         let cache = DnsCache::new().await.unwrap();
-        cache.prewarm("clob.polymarket.com").await.unwrap();
+        cache.prewarm("clob-v2.polymarket.com").await.unwrap();
         cache.clear().await;
         assert_eq!(cache.cache_size().await, 0);
     }

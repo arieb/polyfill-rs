@@ -184,7 +184,7 @@ async fn test_config(
         let start = Instant::now();
 
         match client
-            .get("https://clob.polymarket.com/simplified-markets?next_cursor=MA==")
+            .get("https://clob-v2.polymarket.com/simplified-markets?next_cursor=MA==")
             .send()
             .await
         {

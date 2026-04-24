@@ -1,5 +1,5 @@
 // Test order posting - the critical endpoint that had the 401 bug
-use polyfill_rs::{ClobClient, OrderArgs, Side};
+use polyfill_rs::{ClientConfig, ClobClient, OrderArgs, Side};
 use rust_decimal::Decimal;
 use std::env;
 use std::str::FromStr;
@@ -12,14 +12,27 @@ async fn test_post_order_authentication() {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
 
-    let mut client = ClobClient::with_l1_headers("https://clob.polymarket.com", &private_key, 137);
+    let bootstrap = ClobClient::from_config(ClientConfig {
+        base_url: "https://clob-v2.polymarket.com".to_string(),
+        chain: 137,
+        private_key: Some(private_key.clone()),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build bootstrap client");
 
     println!("Step 1: Creating API credentials...");
-    let creds = client
+    let creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create API key");
-    client.set_api_creds(creds);
+    let client = ClobClient::from_config(ClientConfig {
+        base_url: "https://clob-v2.polymarket.com".to_string(),
+        chain: 137,
+        private_key: Some(private_key),
+        api_credentials: Some(creds),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client");
     println!("API credentials set");
 
     // Use a well-known token ID (we'll use an extreme price so it won't fill)
@@ -31,9 +44,12 @@ async fn test_post_order_authentication() {
         price: Decimal::from_str("0.01").unwrap(), // Very low price, won't fill
         size: Decimal::from_str("1.0").unwrap(),
         side: Side::BUY,
+        expiration: None,
+        builder_code: None,
+        metadata: None,
     };
 
-    let result = client.create_and_post_order(&order_args).await;
+    let result = client.create_and_post_order(&order_args, None, None).await;
 
     match result {
         Ok(response) => {
@@ -41,9 +57,9 @@ async fn test_post_order_authentication() {
             println!("  Response: {:?}", response);
 
             // Try to cancel it if we got an order ID
-            if let Some(order_id) = response.get("orderID").and_then(|v| v.as_str()) {
+            if !response.order_id.is_empty() {
                 println!("\nStep 3: Canceling order...");
-                match client.cancel(order_id).await {
+                match client.cancel(&response.order_id).await {
                     Ok(_) => println!("Order canceled successfully"),
                     Err(e) => println!("Cancel failed (order might have expired): {:?}", e),
                 }

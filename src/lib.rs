@@ -13,22 +13,27 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use polyfill_rs::{ClobClient, OrderArgs, Side};
+//! use polyfill_rs::{ClientConfig, ClobClient, OrderArgs, Side};
 //! use rust_decimal::Decimal;
 //! use std::str::FromStr;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create client (compatible with polymarket-rs-client)
-//!     let mut client = ClobClient::with_l1_headers(
-//!         "https://clob.polymarket.com",
-//!         "your_private_key",
-//!         137,
-//!     );
+//!     let bootstrap = ClobClient::from_config(ClientConfig {
+//!         base_url: "https://clob-v2.polymarket.com".to_string(),
+//!         chain: 137,
+//!         private_key: Some("your_private_key".to_string()),
+//!         ..ClientConfig::default()
+//!     })?;
 //!
-//!     // Get API credentials
-//!     let api_creds = client.create_or_derive_api_key(None).await.unwrap();
-//!     client.set_api_creds(api_creds);
+//!     let api_creds = bootstrap.create_or_derive_api_key(None).await?;
+//!     let client = ClobClient::from_config(ClientConfig {
+//!         base_url: "https://clob-v2.polymarket.com".to_string(),
+//!         chain: 137,
+//!         private_key: Some("your_private_key".to_string()),
+//!         api_credentials: Some(api_creds),
+//!         ..ClientConfig::default()
+//!     })?;
 //!
 //!     // Create and post order
 //!     let order_args = OrderArgs::new(
@@ -38,7 +43,7 @@
 //!         Side::BUY,
 //!     );
 //!
-//!     let result = client.create_and_post_order(&order_args).await.unwrap();
+//!     let result = client.create_and_post_order(&order_args, None, None).await?;
 //!     println!("Order posted: {:?}", result);
 //!
 //!     Ok(())
@@ -54,7 +59,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create a basic client
-//!     let client = ClobClient::new("https://clob.polymarket.com");
+//!     let client = ClobClient::new("https://clob-v2.polymarket.com");
 //!
 //!     // Get market data
 //!     let markets = client.get_sampling_markets(None).await.unwrap();
@@ -72,7 +77,7 @@ use tracing::info;
 
 // Global constants
 pub const DEFAULT_CHAIN_ID: u64 = 137; // Polygon
-pub const DEFAULT_BASE_URL: &str = "https://clob.polymarket.com";
+pub const DEFAULT_BASE_URL: &str = "https://clob-v2.polymarket.com";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;
@@ -152,7 +157,7 @@ pub use crate::types::{
 pub use crate::client::{ClobClient, PolyfillClient};
 
 // Re-export compatibility types (for easy migration from polymarket-rs-client)
-pub use crate::client::OrderArgs;
+pub use crate::types::OrderArgs;
 
 // Re-export error types
 pub use crate::errors::{PolyfillError, Result};

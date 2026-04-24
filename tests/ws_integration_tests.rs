@@ -8,11 +8,11 @@
 #![cfg(feature = "stream")]
 
 use futures::StreamExt;
-use polyfill_rs::{ClobClient, OrderBookManager, WebSocketStream, WsBookUpdateProcessor};
+use polyfill_rs::{ClientConfig, ClobClient, OrderBookManager, WebSocketStream, WsBookUpdateProcessor};
 use std::env;
 use std::time::Duration;
 
-const HOST: &str = "https://clob.polymarket.com";
+const HOST: &str = "https://clob-v2.polymarket.com";
 const WS_MARKET_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const WS_USER_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const CHAIN_ID: u64 = 137;
@@ -147,7 +147,13 @@ async fn test_real_ws_user_channel_connection_stable() {
     // during the window. This test primarily asserts we can authenticate + subscribe
     // and that the connection doesn't immediately drop.
     let private_key = load_private_key();
-    let auth_client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let auth_client = ClobClient::from_config(ClientConfig {
+        base_url: HOST.to_string(),
+        chain: CHAIN_ID,
+        private_key: Some(private_key),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client");
     let api_creds = auth_client
         .create_or_derive_api_key(None)
         .await

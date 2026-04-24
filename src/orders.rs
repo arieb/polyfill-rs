@@ -3,19 +3,22 @@
 //! This module handles the complex process of creating and signing orders
 //! for the Polymarket CLOB, including EIP-712 signature generation.
 
-use crate::auth::sign_order_message;
-use crate::client::OrderArgs;
+use crate::auth::{sign_order_message, SignedOrderMessage};
 use crate::errors::{PolyfillError, Result};
-use crate::types::{ExtraOrderArgs, MarketOrderArgs, OrderOptions, Side, SignedOrderRequest};
-use alloy_primitives::{Address, U256};
+use crate::types::{CreateOrderOptions, MarketOrderArgs, OrderArgs, OrderType, Side, SignedOrderRequest};
+use alloy_primitives::{Address, B256, U256};
 use alloy_signer_local::PrivateKeySigner;
 use rand::Rng;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::RoundingStrategy::{AwayFromZero, MidpointTowardZero, ToZero};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const BYTES32_ZERO: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Signature types for orders
 #[derive(Copy, Clone)]
@@ -91,13 +94,13 @@ static ROUNDING_CONFIG: LazyLock<HashMap<Decimal, RoundConfig>> = LazyLock::new(
 pub fn get_contract_config(chain_id: u64, neg_risk: bool) -> Option<ContractConfig> {
     match (chain_id, neg_risk) {
         (137, false) => Some(ContractConfig {
-            exchange: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".to_string(),
-            collateral: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string(),
+            exchange: "0xE111180000d2663C0091e4f400237545B87B996B".to_string(),
+            collateral: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB".to_string(),
             conditional_tokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string(),
         }),
         (137, true) => Some(ContractConfig {
-            exchange: "0xC5d563A36AE78145C45a50134d48A1215220f80a".to_string(),
-            collateral: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string(),
+            exchange: "0xe2222d279d744050d28e00520010520000310F59".to_string(),
+            collateral: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB".to_string(),
             conditional_tokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string(),
         }),
         _ => None,
@@ -122,6 +125,90 @@ fn decimal_to_token_u32(amt: Decimal) -> u32 {
         amt = amt.round_dp_with_strategy(0, MidpointTowardZero);
     }
     amt.try_into().expect("Couldn't round decimal to integer")
+}
+
+fn parse_round_config(tick_size: Decimal) -> Result<&'static RoundConfig> {
+    ROUNDING_CONFIG
+        .get(&tick_size)
+        .ok_or_else(|| PolyfillError::validation(format!("Unsupported tick size {tick_size}")))
+}
+
+fn validate_bytes32_hex(field: &str, value: &str) -> Result<()> {
+    if value == BYTES32_ZERO {
+        return Ok(());
+    }
+
+    if !value.starts_with("0x") {
+        return Err(PolyfillError::validation(format!(
+            "{field} must be a 0x-prefixed 32-byte hex string"
+        )));
+    }
+
+    if value.len() != 66 {
+        return Err(PolyfillError::validation(format!(
+            "{field} must be exactly 32 bytes (64 hex chars)"
+        )));
+    }
+
+    if !value
+        .as_bytes()
+        .iter()
+        .skip(2)
+        .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(PolyfillError::validation(format!(
+            "{field} must contain only hexadecimal characters"
+        )));
+    }
+
+    Ok(())
+}
+
+fn normalize_optional_bytes32(field: &str, value: Option<&str>) -> Result<String> {
+    let value = value.unwrap_or(BYTES32_ZERO);
+    validate_bytes32_hex(field, value)?;
+    Ok(value.to_string())
+}
+
+pub fn adjust_buy_amount_for_fees(
+    amount: Decimal,
+    price: Decimal,
+    user_usdc_balance: Decimal,
+    fee_rate: Decimal,
+    fee_exponent: u32,
+    builder_taker_fee_rate_bps: Decimal,
+) -> Result<Decimal> {
+    let price_f64 = price
+        .to_f64()
+        .ok_or_else(|| PolyfillError::validation(format!("Invalid price {price}")))?;
+    let amount_f64 = amount
+        .to_f64()
+        .ok_or_else(|| PolyfillError::validation(format!("Invalid amount {amount}")))?;
+    let user_balance_f64 = user_usdc_balance.to_f64().ok_or_else(|| {
+        PolyfillError::validation(format!("Invalid user_usdc_balance {user_usdc_balance}"))
+    })?;
+    let fee_rate_f64 = fee_rate
+        .to_f64()
+        .ok_or_else(|| PolyfillError::validation(format!("Invalid fee rate {fee_rate}")))?;
+    let builder_rate_f64 = builder_taker_fee_rate_bps
+        .to_f64()
+        .ok_or_else(|| PolyfillError::validation(format!(
+            "Invalid builder taker fee rate {builder_taker_fee_rate_bps}"
+        )))?
+        / 10_000.0;
+
+    let platform_fee_rate = fee_rate_f64 * (price_f64 * (1.0 - price_f64)).powi(fee_exponent as i32);
+    let platform_fee = (amount_f64 / price_f64) * platform_fee_rate;
+    let total_cost = amount_f64 + platform_fee + amount_f64 * builder_rate_f64;
+
+    let adjusted = if user_balance_f64 <= total_cost {
+        user_balance_f64 / (1.0 + platform_fee_rate / price_f64 + builder_rate_f64)
+    } else {
+        amount_f64
+    };
+
+    Decimal::from_f64(adjusted)
+        .ok_or_else(|| PolyfillError::validation("Adjusted market buy amount is out of range"))
 }
 
 impl OrderBuilder {
@@ -193,20 +280,33 @@ impl OrderBuilder {
     /// Get order amounts for a market order
     fn get_market_order_amounts(
         &self,
+        side: Side,
         amount: Decimal,
         price: Decimal,
         round_config: &RoundConfig,
     ) -> (u32, u32) {
-        let raw_maker_amt = amount.round_dp_with_strategy(round_config.size, ToZero);
         let raw_price = price.round_dp_with_strategy(round_config.price, MidpointTowardZero);
 
-        let raw_taker_amt = raw_maker_amt / raw_price;
-        let raw_taker_amt = self.fix_amount_rounding(raw_taker_amt, round_config);
+        match side {
+            Side::BUY => {
+                let raw_maker_amt = amount.round_dp_with_strategy(round_config.size, ToZero);
+                let raw_taker_amt = self.fix_amount_rounding(raw_maker_amt / raw_price, round_config);
 
-        (
-            decimal_to_token_u32(raw_maker_amt),
-            decimal_to_token_u32(raw_taker_amt),
-        )
+                (
+                    decimal_to_token_u32(raw_maker_amt),
+                    decimal_to_token_u32(raw_taker_amt),
+                )
+            },
+            Side::SELL => {
+                let raw_maker_amt = amount.round_dp_with_strategy(round_config.size, ToZero);
+                let raw_taker_amt = self.fix_amount_rounding(raw_maker_amt * raw_price, round_config);
+
+                (
+                    decimal_to_token_u32(raw_maker_amt),
+                    decimal_to_token_u32(raw_taker_amt),
+                )
+            },
+        }
     }
 
     /// Calculate market price from order book levels
@@ -214,23 +314,33 @@ impl OrderBuilder {
         &self,
         positions: &[crate::types::BookLevel],
         amount_to_match: Decimal,
+        side: Side,
+        order_type: OrderType,
     ) -> Result<Decimal> {
         let mut sum = Decimal::ZERO;
+        let mut last_price = None;
 
         for level in positions {
-            sum += level.size * level.price;
+            sum += match side {
+                Side::BUY => level.size * level.price,
+                Side::SELL => level.size,
+            };
+            last_price = Some(level.price);
             if sum >= amount_to_match {
                 return Ok(level.price);
             }
         }
 
-        Err(PolyfillError::order(
-            format!(
-                "Not enough liquidity to create market order with amount {}",
-                amount_to_match
-            ),
-            crate::errors::OrderErrorKind::InsufficientBalance,
-        ))
+        match (order_type, last_price) {
+            (OrderType::FAK, Some(price)) => Ok(price),
+            _ => Err(PolyfillError::order(
+                format!(
+                    "Not enough liquidity to create market order with amount {}",
+                    amount_to_match
+                ),
+                crate::errors::OrderErrorKind::InsufficientBalance,
+            )),
+        }
     }
 
     /// Create a market order
@@ -239,15 +349,21 @@ impl OrderBuilder {
         chain_id: u64,
         order_args: &MarketOrderArgs,
         price: Decimal,
-        extras: &ExtraOrderArgs,
-        options: &OrderOptions,
+        options: &CreateOrderOptions,
     ) -> Result<SignedOrderRequest> {
-        let tick_size = options
-            .tick_size
-            .ok_or_else(|| PolyfillError::validation("Cannot create order without tick size"))?;
+        if !matches!(order_args.order_type, OrderType::FOK | OrderType::FAK) {
+            return Err(PolyfillError::validation(
+                "Market orders only support FOK and FAK order types",
+            ));
+        }
+
+        let tick_size = options.tick_size.ok_or_else(|| {
+            PolyfillError::validation("Cannot create order without tick size")
+        })?;
+        let round_config = parse_round_config(tick_size)?;
 
         let (maker_amount, taker_amount) =
-            self.get_market_order_amounts(order_args.amount, price, &ROUNDING_CONFIG[&tick_size]);
+            self.get_market_order_amounts(order_args.side, order_args.amount, price, round_config);
 
         let neg_risk = options
             .neg_risk
@@ -262,13 +378,14 @@ impl OrderBuilder {
 
         self.build_signed_order(
             order_args.token_id.clone(),
-            Side::BUY,
+            order_args.side,
             chain_id,
             exchange_address,
             maker_amount,
             taker_amount,
             0,
-            extras,
+            order_args.builder_code.as_deref(),
+            order_args.metadata.as_deref(),
         )
     }
 
@@ -277,19 +394,18 @@ impl OrderBuilder {
         &self,
         chain_id: u64,
         order_args: &OrderArgs,
-        expiration: u64,
-        extras: &ExtraOrderArgs,
-        options: &OrderOptions,
+        options: &CreateOrderOptions,
     ) -> Result<SignedOrderRequest> {
-        let tick_size = options
-            .tick_size
-            .ok_or_else(|| PolyfillError::validation("Cannot create order without tick size"))?;
+        let tick_size = options.tick_size.ok_or_else(|| {
+            PolyfillError::validation("Cannot create order without tick size")
+        })?;
+        let round_config = parse_round_config(tick_size)?;
 
         let (maker_amount, taker_amount) = self.get_order_amounts(
             order_args.side,
             order_args.size,
             order_args.price,
-            &ROUNDING_CONFIG[&tick_size],
+            round_config,
         );
 
         let neg_risk = options
@@ -310,8 +426,9 @@ impl OrderBuilder {
             exchange_address,
             maker_amount,
             taker_amount,
-            expiration,
-            extras,
+            order_args.expiration.unwrap_or(0),
+            order_args.builder_code.as_deref(),
+            order_args.metadata.as_deref(),
         )
     }
 
@@ -326,28 +443,36 @@ impl OrderBuilder {
         maker_amount: u32,
         taker_amount: u32,
         expiration: u64,
-        extras: &ExtraOrderArgs,
+        builder_code: Option<&str>,
+        metadata: Option<&str>,
     ) -> Result<SignedOrderRequest> {
         let seed = generate_seed();
-        let taker_address = Address::from_str(&extras.taker)
-            .map_err(|e| PolyfillError::validation(format!("Invalid taker address: {}", e)))?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis();
 
         let u256_token_id = U256::from_str_radix(&token_id, 10)
             .map_err(|e| PolyfillError::validation(format!("Incorrect tokenId format: {}", e)))?;
+        let builder = normalize_optional_bytes32("builder_code", builder_code)?;
+        let metadata = normalize_optional_bytes32("metadata", metadata)?;
 
-        let order = crate::auth::Order {
+        let order = SignedOrderMessage {
             salt: U256::from(seed),
             maker: self.funder,
             signer: self.signer.address(),
-            taker: taker_address,
-            tokenId: u256_token_id,
-            makerAmount: U256::from(maker_amount),
-            takerAmount: U256::from(taker_amount),
-            expiration: U256::from(expiration),
-            nonce: extras.nonce,
-            feeRateBps: U256::from(extras.fee_rate_bps),
+            token_id: u256_token_id,
+            maker_amount: U256::from(maker_amount),
+            taker_amount: U256::from(taker_amount),
             side: side as u8,
-            signatureType: self.sig_type as u8,
+            signature_type: self.sig_type as u8,
+            timestamp: U256::from(timestamp),
+            metadata: B256::from_str(&metadata).map_err(|e| {
+                PolyfillError::validation(format!("Invalid metadata bytes32 value: {e}"))
+            })?,
+            builder: B256::from_str(&builder).map_err(|e| {
+                PolyfillError::validation(format!("Invalid builder_code bytes32 value: {e}"))
+            })?,
         };
 
         let signature = sign_order_message(&self.signer, order, chain_id, exchange)?;
@@ -356,15 +481,15 @@ impl OrderBuilder {
             salt: seed,
             maker: self.funder.to_checksum(None),
             signer: self.signer.address().to_checksum(None),
-            taker: taker_address.to_checksum(None),
             token_id,
             maker_amount: maker_amount.to_string(),
             taker_amount: taker_amount.to_string(),
             expiration: expiration.to_string(),
-            nonce: extras.nonce.to_string(),
-            fee_rate_bps: extras.fee_rate_bps.to_string(),
             side: side.as_str().to_string(),
             signature_type: self.sig_type as u8,
+            timestamp: timestamp.to_string(),
+            metadata,
+            builder,
             signature,
         })
     }
@@ -373,6 +498,16 @@ impl OrderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_signer_local::PrivateKeySigner;
+    use serde_json::Value;
+
+    fn test_builder() -> OrderBuilder {
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .expect("valid private key");
+        OrderBuilder::new(signer, None, None)
+    }
 
     #[test]
     fn test_decimal_to_token_u32() {
@@ -405,16 +540,183 @@ mod tests {
     #[test]
     fn test_get_contract_config() {
         // Test Polygon mainnet
-        let config = get_contract_config(137, false);
-        assert!(config.is_some());
+        let config = get_contract_config(137, false).expect("polygon config");
+        assert_eq!(config.exchange, "0xE111180000d2663C0091e4f400237545B87B996B");
+        assert_eq!(config.collateral, "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+        assert_eq!(
+            config.conditional_tokens,
+            "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        );
 
         // Test with neg risk
-        let config_neg = get_contract_config(137, true);
-        assert!(config_neg.is_some());
+        let config_neg = get_contract_config(137, true).expect("neg risk polygon config");
+        assert_eq!(
+            config_neg.exchange,
+            "0xe2222d279d744050d28e00520010520000310F59"
+        );
+        assert_eq!(
+            config_neg.collateral,
+            "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+        );
 
         // Test unsupported chain
         let config_unsupported = get_contract_config(999, false);
         assert!(config_unsupported.is_none());
+    }
+
+    #[test]
+    fn test_normalize_optional_bytes32_defaults_to_zero() {
+        assert_eq!(
+            normalize_optional_bytes32("builder_code", None).unwrap(),
+            BYTES32_ZERO
+        );
+    }
+
+    #[test]
+    fn test_normalize_optional_bytes32_rejects_invalid_hex() {
+        let err = normalize_optional_bytes32("metadata", Some("deadbeef")).unwrap_err();
+        assert!(matches!(err, PolyfillError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_create_order_serializes_v2_fields_without_legacy_fields() {
+        let builder = test_builder();
+        let order = builder
+            .create_order(
+                137,
+                &OrderArgs {
+                    token_id: "123456".to_string(),
+                    price: Decimal::from_str("0.45").unwrap(),
+                    size: Decimal::from_str("12.34").unwrap(),
+                    side: Side::BUY,
+                    expiration: Some(1_900_000_000),
+                    builder_code: Some(BYTES32_ZERO.to_string()),
+                    metadata: None,
+                },
+                &CreateOrderOptions {
+                    tick_size: Some(Decimal::from_str("0.01").unwrap()),
+                    neg_risk: Some(false),
+                },
+            )
+            .unwrap();
+
+        let serialized = serde_json::to_value(&order).unwrap();
+        let object = serialized.as_object().unwrap();
+        assert!(object.contains_key("timestamp"));
+        assert!(object.contains_key("metadata"));
+        assert!(object.contains_key("builder"));
+        assert!(object.contains_key("expiration"));
+        assert!(!object.contains_key("taker"));
+        assert!(!object.contains_key("nonce"));
+        assert!(!object.contains_key("feeRateBps"));
+        assert_eq!(order.builder, BYTES32_ZERO);
+        assert_eq!(order.metadata, BYTES32_ZERO);
+    }
+
+    #[test]
+    fn test_create_market_order_supports_fak() {
+        let builder = test_builder();
+        let order = builder
+            .create_market_order(
+                137,
+                &MarketOrderArgs {
+                    token_id: "123456".to_string(),
+                    amount: Decimal::from_str("10.0").unwrap(),
+                    side: Side::BUY,
+                    order_type: OrderType::FAK,
+                    price_limit: None,
+                    user_usdc_balance: None,
+                    builder_code: None,
+                    metadata: None,
+                },
+                Decimal::from_str("0.25").unwrap(),
+                &CreateOrderOptions {
+                    tick_size: Some(Decimal::from_str("0.01").unwrap()),
+                    neg_risk: Some(false),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(order.side, "BUY");
+        assert!(!order.timestamp.is_empty());
+    }
+
+    #[test]
+    fn test_market_order_amounts_differ_for_buy_and_sell() {
+        let builder = test_builder();
+        let round_config = parse_round_config(Decimal::from_str("0.01").unwrap()).unwrap();
+
+        let (buy_maker, buy_taker) = builder.get_market_order_amounts(
+            Side::BUY,
+            Decimal::from_str("10").unwrap(),
+            Decimal::from_str("0.25").unwrap(),
+            round_config,
+        );
+        let (sell_maker, sell_taker) = builder.get_market_order_amounts(
+            Side::SELL,
+            Decimal::from_str("10").unwrap(),
+            Decimal::from_str("0.25").unwrap(),
+            round_config,
+        );
+
+        assert_eq!(buy_maker, 10_000_000);
+        assert_eq!(buy_taker, 40_000_000);
+        assert_eq!(sell_maker, 10_000_000);
+        assert_eq!(sell_taker, 2_500_000);
+    }
+
+    #[test]
+    fn test_calculate_market_price_returns_last_level_for_fak() {
+        let builder = test_builder();
+        let levels = vec![
+            crate::types::BookLevel {
+                price: Decimal::from_str("0.40").unwrap(),
+                size: Decimal::from_str("2.0").unwrap(),
+            },
+            crate::types::BookLevel {
+                price: Decimal::from_str("0.45").unwrap(),
+                size: Decimal::from_str("1.0").unwrap(),
+            },
+        ];
+
+        let price = builder
+            .calculate_market_price(
+                &levels,
+                Decimal::from_str("10.0").unwrap(),
+                Side::SELL,
+                OrderType::FAK,
+            )
+            .unwrap();
+        assert_eq!(price, Decimal::from_str("0.45").unwrap());
+    }
+
+    #[test]
+    fn test_signed_order_json_uses_camel_case_wire_shape() {
+        let builder = test_builder();
+        let order = builder
+            .create_order(
+                137,
+                &OrderArgs {
+                    token_id: "123456".to_string(),
+                    price: Decimal::from_str("0.55").unwrap(),
+                    size: Decimal::from_str("5.0").unwrap(),
+                    side: Side::SELL,
+                    expiration: Some(1_900_000_000),
+                    builder_code: None,
+                    metadata: Some(BYTES32_ZERO.to_string()),
+                },
+                &CreateOrderOptions {
+                    tick_size: Some(Decimal::from_str("0.01").unwrap()),
+                    neg_risk: Some(true),
+                },
+            )
+            .unwrap();
+
+        let json = serde_json::to_value(order).unwrap();
+        assert!(matches!(json.get("tokenId"), Some(Value::String(_))));
+        assert!(matches!(json.get("makerAmount"), Some(Value::String(_))));
+        assert!(matches!(json.get("takerAmount"), Some(Value::String(_))));
+        assert!(matches!(json.get("signatureType"), Some(Value::Number(_))));
     }
 
     #[test]

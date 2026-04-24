@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/polyfill-rs/badge.svg)](https://docs.rs/polyfill-rs)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-A high-performance Polymarket Rust client with latency-optimized data structures and zero-allocation hot paths. An API-compatible drop-in replacement for `polymarket-rs-client` with identical method signatures. 
+A high-performance Polymarket Rust client with latency-optimized data structures and zero-allocation hot paths. The `0.4.x` line is V2-native and intentionally breaking for authenticated trading flows.
 
 At the time that this project was started, `polymarket-rs-client` was a Polymarket Rust Client with a few GitHub stars, but which seemed to be unmaintained. I took on the task of creating a Rust client which could beat the benchmarks quoted in the README.md of that project, with the added constraint of also maintaining zero alloc hot paths.
 
@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-polyfill-rs = "0.3.0"
+polyfill-rs = "0.4.0"
 ```
 
 Replace your imports:
@@ -32,7 +32,7 @@ use polyfill_rs::{ClobClient, Side, OrderType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ClobClient::new("https://clob.polymarket.com");
+    let client = ClobClient::new("https://clob-v2.polymarket.com");
     let markets = client.get_sampling_markets(None).await?;
     println!("Found {} markets", markets.data.len());
     Ok(())

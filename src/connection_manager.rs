@@ -101,14 +101,14 @@ mod tests {
     #[tokio::test]
     async fn test_connection_manager_creation() {
         let client = reqwest::ClientBuilder::new().no_proxy().build().unwrap();
-        let manager = ConnectionManager::new(client, "https://clob.polymarket.com".to_string());
+        let manager = ConnectionManager::new(client, "https://clob-v2.polymarket.com".to_string());
         assert!(!manager.is_running());
     }
 
     #[tokio::test]
     async fn test_keepalive_start_stop() {
         let client = reqwest::ClientBuilder::new().no_proxy().build().unwrap();
-        let manager = ConnectionManager::new(client, "https://clob.polymarket.com".to_string());
+        let manager = ConnectionManager::new(client, "https://clob-v2.polymarket.com".to_string());
 
         manager.start_keepalive(Duration::from_secs(30)).await;
         tokio::time::sleep(Duration::from_millis(100)).await;

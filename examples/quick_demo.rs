@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
     info!("======================");
 
     // Create client
-    let client = ClobClient::new("https://clob.polymarket.com");
+    let client = ClobClient::new("https://clob-v2.polymarket.com");
 
     // Test 1: Basic connectivity
     info!("\nTesting API Connectivity...");

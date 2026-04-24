@@ -2,11 +2,11 @@
 // These tests hit the real Polymarket API and are ignored by default
 // Run with: cargo test --test integration_tests -- --ignored --test-threads=1
 
-use polyfill_rs::{ClobClient, OrderArgs, Side};
+use polyfill_rs::{ClientConfig, ClobClient, OrderArgs, Side};
 use rust_decimal_macros::dec;
 use std::env;
 
-const HOST: &str = "https://clob.polymarket.com";
+const HOST: &str = "https://clob-v2.polymarket.com";
 const CHAIN_ID: u64 = 137;
 
 fn load_env_vars() -> (String, Option<String>, Option<String>, Option<String>) {
@@ -21,12 +21,33 @@ fn load_env_vars() -> (String, Option<String>, Option<String>, Option<String>) {
     (private_key, api_key, api_secret, api_passphrase)
 }
 
+fn bootstrap_client(private_key: &str) -> ClobClient {
+    ClobClient::from_config(ClientConfig {
+        base_url: HOST.to_string(),
+        chain: CHAIN_ID,
+        private_key: Some(private_key.to_string()),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build bootstrap client")
+}
+
+fn authenticated_client(private_key: String, api_credentials: polyfill_rs::ApiCredentials) -> ClobClient {
+    ClobClient::from_config(ClientConfig {
+        base_url: HOST.to_string(),
+        chain: CHAIN_ID,
+        private_key: Some(private_key),
+        api_credentials: Some(api_credentials),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_real_api_create_derive_api_key() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let client = bootstrap_client(&private_key);
 
     // Test creating/deriving API key
     let result = client.create_or_derive_api_key(None).await;
@@ -50,15 +71,15 @@ async fn test_real_api_authenticated_order_flow() {
     let (private_key, _, _, _) = load_env_vars();
 
     // Initialize client with L1 headers
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let bootstrap = bootstrap_client(&private_key);
 
     // Step 1: Create/derive API credentials
     println!("Step 1: Creating/deriving API credentials...");
-    let api_creds = client
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
     println!("PASS: API credentials set");
 
     // Step 2: Get a valid token_id from active markets
@@ -102,9 +123,12 @@ async fn test_real_api_authenticated_order_flow() {
         price: order_price,
         size: dec!(1.0), // Small size (auth is the thing we're testing here)
         side,
+        expiration: None,
+        builder_code: None,
+        metadata: None,
     };
 
-    let post_result = client.create_and_post_order(&order_args).await;
+    let post_result = client.create_and_post_order(&order_args, None, None).await;
 
     // This is the critical test - did we get past the 401 error?
     match &post_result {
@@ -112,9 +136,9 @@ async fn test_real_api_authenticated_order_flow() {
             println!("PASS: Order posted successfully!");
 
             // Step 5: Cancel the order
-            if let Some(order_id) = response.get("orderID").and_then(|v| v.as_str()) {
-                println!("Step 5: Canceling order {}...", order_id);
-                let cancel_result = client.cancel(order_id).await;
+            if !response.order_id.is_empty() {
+                println!("Step 5: Canceling order {}...", response.order_id);
+                let cancel_result = client.cancel(&response.order_id).await;
                 assert!(
                     cancel_result.is_ok(),
                     "Failed to cancel order: {:?}",
@@ -156,12 +180,12 @@ async fn test_real_api_authenticated_order_flow() {
 async fn test_real_api_get_orders() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_orders...");
     let result = client.get_orders(None, None).await;
@@ -186,12 +210,12 @@ async fn test_real_api_get_orders() {
 async fn test_real_api_get_trades() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_trades...");
     let result = client.get_trades(None, None).await;
@@ -215,12 +239,12 @@ async fn test_real_api_get_trades() {
 async fn test_real_api_get_balance_allowance() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_balance_allowance...");
 
@@ -260,12 +284,12 @@ async fn test_real_api_get_balance_allowance() {
 async fn test_real_api_get_api_keys() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_api_keys...");
     let result = client.get_api_keys().await;
@@ -290,12 +314,12 @@ async fn test_real_api_get_api_keys() {
 async fn test_real_api_get_notifications() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_notifications...");
     let result = client.get_notifications().await;
@@ -320,7 +344,7 @@ async fn test_real_api_get_notifications() {
 async fn test_real_api_market_data_endpoints() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let client = bootstrap_client(&private_key);
 
     println!("Testing market data endpoints (no auth required)...");
 
@@ -387,7 +411,7 @@ async fn test_real_api_market_data_endpoints() {
 async fn test_real_api_batch_endpoints() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let client = bootstrap_client(&private_key);
 
     println!("Testing batch endpoints...");
 

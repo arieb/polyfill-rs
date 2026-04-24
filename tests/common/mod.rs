@@ -1,6 +1,6 @@
 //! Common utilities for integration tests
 
-use polyfill_rs::{ClobClient, Result};
+use polyfill_rs::{ClientConfig, ClobClient, Result};
 use std::env;
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct TestConfig {
     pub host: String,
-    pub chain_id: u64,
+    pub chain: u64,
     pub private_key: Option<String>,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
@@ -19,8 +19,9 @@ pub struct TestConfig {
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
-            host: env::var("POLYMARKET_HOST").unwrap_or_else(|_| "https://clob.polymarket.com".to_string()),
-            chain_id: env::var("POLYMARKET_CHAIN_ID")
+            host: env::var("POLYMARKET_HOST")
+                .unwrap_or_else(|_| "https://clob-v2.polymarket.com".to_string()),
+            chain: env::var("POLYMARKET_CHAIN_ID")
                 .unwrap_or_else(|_| "137".to_string())
                 .parse()
                 .unwrap_or(137),
@@ -57,17 +58,26 @@ impl TestConfig {
 
     /// Create an authenticated client for testing
     pub fn create_auth_client(&self) -> Result<ClobClient> {
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| polyfill_rs::PolyfillError::auth("No private key provided", polyfill_rs::errors::AuthErrorKind::InvalidCredentials))?;
-        
-        Ok(ClobClient::with_l1_headers(&self.host, private_key, self.chain_id))
+        let private_key = self.private_key.as_ref().ok_or_else(|| {
+            polyfill_rs::PolyfillError::auth(
+                "No private key provided",
+                polyfill_rs::errors::AuthErrorKind::InvalidCredentials,
+            )
+        })?;
+
+        ClobClient::from_config(ClientConfig {
+            base_url: self.host.clone(),
+            chain: self.chain,
+            private_key: Some(private_key.clone()),
+            ..ClientConfig::default()
+        })
     }
 
     /// Print test configuration (without sensitive data)
     pub fn print_config(&self) {
         println!("Test Configuration:");
         println!("  Host: {}", self.host);
-        println!("  Chain ID: {}", self.chain_id);
+        println!("  Chain ID: {}", self.chain);
         println!("  Has Auth: {}", self.has_auth());
         println!("  Has API Creds: {}", self.has_api_creds());
         println!("  Timeout: {:?}", self.test_timeout);

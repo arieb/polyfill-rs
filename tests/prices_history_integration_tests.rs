@@ -7,7 +7,7 @@
 
 use polyfill_rs::{ClobClient, PricesHistoryInterval};
 
-const HOST: &str = "https://clob.polymarket.com";
+const HOST: &str = "https://clob-v2.polymarket.com";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]

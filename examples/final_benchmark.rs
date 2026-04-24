@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=20 {
         let start = Instant::now();
         let response = client
-            .get("https://clob.polymarket.com/simplified-markets?next_cursor=MA==")
+            .get("https://clob-v2.polymarket.com/simplified-markets?next_cursor=MA==")
             .send()
             .await?;
 

@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create client with API credentials only (no private key needed for custodial trading)
-    let mut client = ClobClient::new("https://clob.polymarket.com");
+    let mut client = ClobClient::new("https://clob-v2.polymarket.com");
     client.set_api_creds(api_creds);
 
     println!("✅ Client configured for custodial API trading");

@@ -3,7 +3,7 @@
 //! This module defines all the stable public types used throughout the client.
 //! These types are optimized for latency-sensitive trading environments.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -215,6 +215,7 @@ pub enum OrderType {
     GTC,
     FOK,
     GTD,
+    FAK,
 }
 
 impl OrderType {
@@ -223,6 +224,7 @@ impl OrderType {
             OrderType::GTC => "GTC",
             OrderType::FOK => "FOK",
             OrderType::GTD => "GTD",
+            OrderType::FAK => "FAK",
         }
     }
 }
@@ -494,37 +496,97 @@ pub struct ApiCredentials {
     pub passphrase: String,
 }
 
-/// Configuration for order creation
-#[derive(Debug, Clone)]
-pub struct OrderOptions {
-    pub tick_size: Option<Decimal>,
-    pub neg_risk: Option<bool>,
-    pub fee_rate_bps: Option<u32>,
+/// Limit order arguments for V2 order creation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderArgs {
+    pub token_id: String,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub side: Side,
+    pub expiration: Option<u64>,
+    pub builder_code: Option<String>,
+    pub metadata: Option<String>,
 }
 
-/// Extra arguments for order creation
-#[derive(Debug, Clone)]
-pub struct ExtraOrderArgs {
-    pub fee_rate_bps: u32,
-    pub nonce: U256,
-    pub taker: String,
-}
-
-impl Default for ExtraOrderArgs {
-    fn default() -> Self {
+impl OrderArgs {
+    pub fn new(token_id: &str, price: Decimal, size: Decimal, side: Side) -> Self {
         Self {
-            fee_rate_bps: 0,
-            nonce: U256::ZERO,
-            taker: "0x0000000000000000000000000000000000000000".to_string(),
+            token_id: token_id.to_string(),
+            price,
+            size,
+            side,
+            expiration: None,
+            builder_code: None,
+            metadata: None,
         }
     }
 }
 
-/// Market order arguments
-#[derive(Debug, Clone)]
+impl Default for OrderArgs {
+    fn default() -> Self {
+        Self {
+            token_id: String::new(),
+            price: Decimal::ZERO,
+            size: Decimal::ZERO,
+            side: Side::BUY,
+            expiration: None,
+            builder_code: None,
+            metadata: None,
+        }
+    }
+}
+
+/// Market order arguments for V2 order creation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MarketOrderArgs {
     pub token_id: String,
     pub amount: Decimal,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub price_limit: Option<Decimal>,
+    pub user_usdc_balance: Option<Decimal>,
+    pub builder_code: Option<String>,
+    pub metadata: Option<String>,
+}
+
+impl MarketOrderArgs {
+    pub fn new(token_id: &str, amount: Decimal, side: Side, order_type: OrderType) -> Self {
+        Self {
+            token_id: token_id.to_string(),
+            amount,
+            side,
+            order_type,
+            price_limit: None,
+            user_usdc_balance: None,
+            builder_code: None,
+            metadata: None,
+        }
+    }
+}
+
+/// Options used while constructing an order.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CreateOrderOptions {
+    pub tick_size: Option<Decimal>,
+    pub neg_risk: Option<bool>,
+}
+
+/// Options used while posting a signed order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostOrderOptions {
+    pub order_type: OrderType,
+    pub post_only: bool,
+    pub defer_exec: bool,
+}
+
+impl Default for PostOrderOptions {
+    fn default() -> Self {
+        Self {
+            order_type: OrderType::GTC,
+            post_only: false,
+            defer_exec: false,
+        }
+    }
 }
 
 /// Signed order request ready for submission
@@ -534,15 +596,15 @@ pub struct SignedOrderRequest {
     pub salt: u64,
     pub maker: String,
     pub signer: String,
-    pub taker: String,
     pub token_id: String,
     pub maker_amount: String,
     pub taker_amount: String,
     pub expiration: String,
-    pub nonce: String,
-    pub fee_rate_bps: String,
     pub side: String,
     pub signature_type: u8,
+    pub timestamp: String,
+    pub metadata: String,
+    pub builder: String,
     pub signature: String,
 }
 
@@ -553,16 +615,93 @@ pub struct PostOrder {
     pub order: SignedOrderRequest,
     pub owner: String,
     pub order_type: OrderType,
+    pub post_only: bool,
+    pub defer_exec: bool,
 }
 
 impl PostOrder {
-    pub fn new(order: SignedOrderRequest, owner: String, order_type: OrderType) -> Self {
+    pub fn new(order: SignedOrderRequest, owner: String, options: PostOrderOptions) -> Self {
         Self {
             order,
             owner,
-            order_type,
+            order_type: options.order_type,
+            post_only: options.post_only,
+            defer_exec: options.defer_exec,
         }
     }
+}
+
+/// Typed response from `POST /order`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostOrderResponse {
+    pub success: bool,
+    #[serde(rename = "orderID")]
+    pub order_id: String,
+    pub status: String,
+    pub making_amount: String,
+    pub taking_amount: String,
+    #[serde(default)]
+    pub transactions_hashes: Vec<String>,
+    #[serde(default)]
+    pub trade_ids: Vec<String>,
+    #[serde(default)]
+    pub error_msg: String,
+}
+
+/// Typed response from cancel endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelOrdersResponse {
+    #[serde(default)]
+    pub canceled: Vec<String>,
+    #[serde(default, alias = "not_canceled")]
+    pub not_canceled: std::collections::HashMap<String, String>,
+}
+
+/// Token info returned by `GET /clob-markets/{condition_id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClobTokenInfo {
+    pub t: String,
+    pub o: String,
+}
+
+/// Fee details returned by `GET /clob-markets/{condition_id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClobFeeDetails {
+    pub r: Decimal,
+    pub e: u32,
+    #[serde(default)]
+    pub to: bool,
+}
+
+/// CLOB market info returned by `GET /clob-markets/{condition_id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClobMarketInfo {
+    #[serde(default)]
+    pub gst: Option<String>,
+    pub r: serde_json::Value,
+    pub t: Vec<ClobTokenInfo>,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    pub mos: Decimal,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    pub mts: Decimal,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    pub mbf: Decimal,
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    pub tbf: Decimal,
+    #[serde(default)]
+    pub rfqe: bool,
+    #[serde(default)]
+    pub itode: bool,
+    #[serde(default)]
+    pub ibce: bool,
+    #[serde(default)]
+    pub nr: Option<bool>,
+    #[serde(default)]
+    pub fd: Option<ClobFeeDetails>,
+    #[serde(default, deserialize_with = "crate::decode::deserializers::optional_number_from_string")]
+    pub oas: Option<u64>,
 }
 
 /// Market information
@@ -630,15 +769,13 @@ pub struct ClientConfig {
     /// Base URL for the API
     pub base_url: String,
     /// Chain ID for the network
-    pub chain_id: u64,
+    pub chain: u64,
     /// Private key for signing (optional)
     pub private_key: Option<String>,
     /// API credentials (optional)
     pub api_credentials: Option<ApiCredentials>,
-    /// Maximum slippage tolerance
-    pub max_slippage: Option<Decimal>,
-    /// Fee rate in basis points
-    pub fee_rate: Option<Decimal>,
+    /// Builder code applied to orders when none is specified on the order itself.
+    pub builder_code: Option<String>,
     /// Request timeout
     pub timeout: Option<std::time::Duration>,
     /// Maximum number of connections
@@ -648,14 +785,13 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://clob.polymarket.com".to_string(),
-            chain_id: 137, // Polygon mainnet
+            base_url: "https://clob-v2.polymarket.com".to_string(),
+            chain: 137, // Polygon mainnet
             private_key: None,
             api_credentials: None,
+            builder_code: None,
             timeout: Some(std::time::Duration::from_secs(30)),
             max_connections: Some(100),
-            max_slippage: None,
-            fee_rate: None,
         }
     }
 }
@@ -1374,7 +1510,8 @@ pub struct Rewards {
 /// Fee rate in basis points for a given token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeRateResponse {
-    pub fee_rate_bps: u32,
+    #[serde(alias = "fee_rate_bps")]
+    pub base_fee: u32,
 }
 
 /// Create RFQ request (Requester).
@@ -1655,5 +1792,3 @@ pub type Result<T> = std::result::Result<T, crate::errors::PolyfillError>;
 
 // Type aliases for 100% compatibility with baseline implementation
 pub type ApiCreds = ApiCredentials;
-pub type CreateOrderOptions = OrderOptions;
-pub type OrderArgs = OrderRequest;
