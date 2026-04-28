@@ -27,8 +27,12 @@ impl Default for TestConfig {
                 .unwrap_or(137),
             private_key: env::var("POLYMARKET_PRIVATE_KEY").ok(),
             api_key: env::var("POLYMARKET_API_KEY").ok(),
-            api_secret: env::var("POLYMARKET_API_SECRET").ok(),
-            api_passphrase: env::var("POLYMARKET_API_PASSPHRASE").ok(),
+            api_secret: env::var("POLYMARKET_API_SECRET")
+                .or_else(|_| env::var("POLYMARKET_SECRET"))
+                .ok(),
+            api_passphrase: env::var("POLYMARKET_API_PASSPHRASE")
+                .or_else(|_| env::var("POLYMARKET_PASSPHRASE"))
+                .ok(),
             test_timeout: Duration::from_secs(30),
         }
     }

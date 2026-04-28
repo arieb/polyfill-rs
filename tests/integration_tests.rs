@@ -15,8 +15,12 @@ fn load_env_vars() -> (String, Option<String>, Option<String>, Option<String>) {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
     let api_key = env::var("POLYMARKET_API_KEY").ok();
-    let api_secret = env::var("POLYMARKET_API_SECRET").ok();
-    let api_passphrase = env::var("POLYMARKET_API_PASSPHRASE").ok();
+    let api_secret = env::var("POLYMARKET_API_SECRET")
+        .or_else(|_| env::var("POLYMARKET_SECRET"))
+        .ok();
+    let api_passphrase = env::var("POLYMARKET_API_PASSPHRASE")
+        .or_else(|_| env::var("POLYMARKET_PASSPHRASE"))
+        .ok();
 
     (private_key, api_key, api_secret, api_passphrase)
 }

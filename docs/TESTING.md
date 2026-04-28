@@ -45,9 +45,17 @@ export POLYMARKET_API_KEY="your_api_key"
 export POLYMARKET_API_SECRET="your_api_secret"
 export POLYMARKET_API_PASSPHRASE="your_passphrase"
 
+# Backward-compatible aliases also accepted by test helpers
+export POLYMARKET_SECRET="your_api_secret"
+export POLYMARKET_PASSPHRASE="your_passphrase"
+
 # Optional (defaults provided in test helpers)
 export POLYMARKET_HOST="https://clob.polymarket.com"
 export POLYMARKET_CHAIN_ID="137"
+
+# Optional: pin clob.polymarket.com to a known A record if local DNS is blocked.
+# Keep the hostname in POLYMARKET_HOST so HTTPS/SNI still validates.
+export POLYMARKET_RESOLVE_IP="104.18.34.205"
 ```
 
 #### 2. Run Integration Tests
@@ -126,6 +134,11 @@ curl -I https://clob.polymarket.com/
 
 # Check DNS resolution
 nslookup clob.polymarket.com
+
+# If local DNS fails but outbound HTTPS works, get a current A record and pin it:
+curl -sS -H 'accept:application/dns-json' \
+  'https://cloudflare-dns.com/dns-query?name=clob.polymarket.com&type=A'
+export POLYMARKET_RESOLVE_IP="104.18.34.205"
 ```
 
 #### Authentication Issues

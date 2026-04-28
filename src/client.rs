@@ -19,6 +19,7 @@ use reqwest::{Method, RequestBuilder};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Value;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -30,7 +31,11 @@ struct MarketByTokenResponse {
     condition_id: String,
 }
 
-fn build_http_client(timeout: Option<Duration>, max_connections: Option<usize>) -> Client {
+fn build_http_client(
+    host: &str,
+    timeout: Option<Duration>,
+    max_connections: Option<usize>,
+) -> Client {
     let max_connections = max_connections.unwrap_or(10);
     let mut builder = reqwest::ClientBuilder::new()
         .no_proxy()
@@ -44,12 +49,29 @@ fn build_http_client(timeout: Option<Duration>, max_connections: Option<usize>) 
         builder = builder.timeout(timeout);
     }
 
+    if let Ok(resolve_ip) = std::env::var("POLYMARKET_RESOLVE_IP") {
+        if let Ok(ip) = resolve_ip.parse::<IpAddr>() {
+            if let Some(hostname) = extract_hostname(host) {
+                builder = builder.resolve(hostname, SocketAddr::new(ip, 443));
+            }
+        }
+    }
+
     builder.build().unwrap_or_else(|_| {
         reqwest::ClientBuilder::new()
             .no_proxy()
             .build()
             .expect("Failed to build reqwest client")
     })
+}
+
+fn extract_hostname(host: &str) -> Option<&str> {
+    host.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .and_then(|authority| authority.split(':').next())
+        .filter(|hostname| !hostname.is_empty())
 }
 
 /// Main client for interacting with Polymarket API
@@ -129,7 +151,7 @@ impl ClobClient {
     /// Create a new client with optimized HTTP/2 settings (benchmarked 11.4% faster)
     /// Now includes DNS caching, connection management, and buffer pooling
     pub fn new(host: &str) -> Self {
-        let http_client = build_http_client(None, None);
+        let http_client = build_http_client(host, None, None);
         Self::build_client(host, 137, http_client, None, None, None)
     }
 
@@ -144,7 +166,8 @@ impl ClobClient {
             None => None,
         };
 
-        let http_client = build_http_client(config.timeout, config.max_connections);
+        let http_client =
+            build_http_client(&config.base_url, config.timeout, config.max_connections);
 
         Ok(Self::build_client(
             &config.base_url,
