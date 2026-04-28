@@ -13,6 +13,8 @@ pub struct TestConfig {
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub api_passphrase: Option<String>,
+    pub signature_type: Option<u8>,
+    pub funder: Option<String>,
     pub test_timeout: Duration,
 }
 
@@ -32,6 +34,12 @@ impl Default for TestConfig {
                 .ok(),
             api_passphrase: env::var("POLYMARKET_API_PASSPHRASE")
                 .or_else(|_| env::var("POLYMARKET_PASSPHRASE"))
+                .ok(),
+            signature_type: env::var("POLYMARKET_SIGNATURE_TYPE")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok()),
+            funder: env::var("POLYMARKET_FUNDER")
+                .or_else(|_| env::var("POLYMARKET_FUNDER_ADDRESS"))
                 .ok(),
             test_timeout: Duration::from_secs(30),
         }
@@ -73,6 +81,8 @@ impl TestConfig {
             base_url: self.host.clone(),
             chain: self.chain,
             private_key: Some(private_key.clone()),
+            signature_type: self.signature_type,
+            funder: self.funder.clone(),
             ..ClientConfig::default()
         })
     }
@@ -84,6 +94,8 @@ impl TestConfig {
         println!("  Chain ID: {}", self.chain);
         println!("  Has Auth: {}", self.has_auth());
         println!("  Has API Creds: {}", self.has_api_creds());
+        println!("  Signature Type: {:?}", self.signature_type);
+        println!("  Has Funder Override: {}", self.funder.is_some());
         println!("  Timeout: {:?}", self.test_timeout);
     }
 }

@@ -11,7 +11,7 @@ use crate::types::{
     MarketOrderArgs, OrderArgs, OrderType, PostOrder, PostOrderOptions, PostOrderResponse, Side,
     SignedOrderRequest,
 };
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use reqwest::header::HeaderName;
 use reqwest::Client;
@@ -99,6 +99,8 @@ impl ClobClient {
         signer: Option<PrivateKeySigner>,
         api_creds: Option<ApiCreds>,
         builder_code: Option<String>,
+        sig_type: Option<crate::orders::SigType>,
+        funder: Option<Address>,
     ) -> Self {
         let dns_cache = tokio::runtime::Handle::try_current().ok().and_then(|_| {
             tokio::task::block_in_place(|| {
@@ -132,7 +134,7 @@ impl ClobClient {
 
         let order_builder = signer
             .clone()
-            .map(|signer| crate::orders::OrderBuilder::new(signer, None, None));
+            .map(|signer| crate::orders::OrderBuilder::new(signer, sig_type, funder));
 
         Self {
             http_client,
@@ -152,7 +154,7 @@ impl ClobClient {
     /// Now includes DNS caching, connection management, and buffer pooling
     pub fn new(host: &str) -> Self {
         let http_client = build_http_client(host, None, None);
-        Self::build_client(host, 137, http_client, None, None, None)
+        Self::build_client(host, 137, http_client, None, None, None, None, None)
     }
 
     /// Create a V2-native client from config.
@@ -166,6 +168,26 @@ impl ClobClient {
             None => None,
         };
 
+        let sig_type = config
+            .signature_type
+            .map(crate::orders::sig_type_from_u8)
+            .transpose()?;
+        let explicit_funder = config
+            .funder
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .map_err(|e| PolyfillError::config(format!("Invalid funder address: {e}")))?;
+        let funder = match (&signer, sig_type) {
+            (Some(signer), Some(sig_type)) => crate::orders::resolve_funder(
+                signer.address(),
+                config.chain,
+                sig_type,
+                explicit_funder,
+            )?,
+            _ => explicit_funder,
+        };
+
         let http_client =
             build_http_client(&config.base_url, config.timeout, config.max_connections);
 
@@ -176,6 +198,8 @@ impl ClobClient {
             signer,
             config.api_credentials,
             config.builder_code,
+            sig_type,
+            funder,
         ))
     }
 
@@ -187,7 +211,7 @@ impl ClobClient {
                 .build()
                 .expect("Failed to build reqwest client")
         });
-        Self::build_client(host, 137, http_client, None, None, None)
+        Self::build_client(host, 137, http_client, None, None, None, None, None)
     }
 
     /// Create a client optimized for internet connections
@@ -198,7 +222,7 @@ impl ClobClient {
                 .build()
                 .expect("Failed to build reqwest client")
         });
-        Self::build_client(host, 137, http_client, None, None, None)
+        Self::build_client(host, 137, http_client, None, None, None, None, None)
     }
 
     /// Create a client with L1 headers (for authentication)

@@ -806,6 +806,11 @@ pub struct ClientConfig {
     pub api_credentials: Option<ApiCredentials>,
     /// Builder code applied to orders when none is specified on the order itself.
     pub builder_code: Option<String>,
+    /// Polymarket signature type: 0 EOA, 1 Proxy, 2 Gnosis Safe, 3 Poly1271.
+    pub signature_type: Option<u8>,
+    /// Address that holds funds for proxy/Safe/smart-contract wallet flows.
+    /// If omitted for signature type 1 or 2, the Polygon funder is derived from the signer.
+    pub funder: Option<String>,
     /// Request timeout
     pub timeout: Option<std::time::Duration>,
     /// Maximum number of connections
@@ -820,6 +825,8 @@ impl Default for ClientConfig {
             private_key: None,
             api_credentials: None,
             builder_code: None,
+            signature_type: None,
+            funder: None,
             timeout: Some(std::time::Duration::from_secs(30)),
             max_connections: Some(100),
         }

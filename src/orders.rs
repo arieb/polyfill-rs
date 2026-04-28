@@ -8,7 +8,7 @@ use crate::errors::{PolyfillError, Result};
 use crate::types::{
     CreateOrderOptions, MarketOrderArgs, OrderArgs, OrderType, Side, SignedOrderRequest,
 };
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_signer_local::PrivateKeySigner;
 use rand::Rng;
 use rust_decimal::Decimal;
@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const BYTES32_ZERO: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Signature types for orders
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SigType {
     /// ECDSA EIP712 signatures signed by EOAs
     Eoa = 0,
@@ -29,6 +29,8 @@ pub enum SigType {
     PolyProxy = 1,
     /// EIP712 signatures signed by EOAs that own Polymarket Gnosis safes
     PolyGnosisSafe = 2,
+    /// EIP-1271 smart contract wallet signatures (V2 orders only)
+    Poly1271 = 3,
 }
 
 /// Rounding configuration for different tick sizes
@@ -51,6 +53,13 @@ pub struct OrderBuilder {
     sig_type: SigType,
     funder: Address,
 }
+
+const POLYGON_PROXY_FACTORY: &str = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052";
+const POLYGON_SAFE_FACTORY: &str = "0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b";
+const PROXY_INIT_CODE_HASH: &str =
+    "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b";
+const SAFE_INIT_CODE_HASH: &str =
+    "0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf";
 
 /// Rounding configurations for different tick sizes
 static ROUNDING_CONFIG: LazyLock<HashMap<Decimal, RoundConfig>> = LazyLock::new(|| {
@@ -104,6 +113,70 @@ pub fn get_contract_config(chain_id: u64, neg_risk: bool) -> Option<ContractConf
             conditional_tokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".to_string(),
         }),
         _ => None,
+    }
+}
+
+pub fn sig_type_from_u8(signature_type: u8) -> Result<SigType> {
+    match signature_type {
+        0 => Ok(SigType::Eoa),
+        1 => Ok(SigType::PolyProxy),
+        2 => Ok(SigType::PolyGnosisSafe),
+        3 => Ok(SigType::Poly1271),
+        other => Err(PolyfillError::validation(format!(
+            "Unsupported signature_type {other}"
+        ))),
+    }
+}
+
+pub fn derive_proxy_wallet(eoa_address: Address, chain_id: u64) -> Result<Address> {
+    if chain_id != 137 {
+        return Err(PolyfillError::config(
+            "Proxy wallet auto-derivation is only configured for Polygon mainnet",
+        ));
+    }
+
+    let factory = Address::from_str(POLYGON_PROXY_FACTORY)
+        .map_err(|e| PolyfillError::config(format!("Invalid proxy factory address: {e}")))?;
+    let init_code_hash = B256::from_str(PROXY_INIT_CODE_HASH)
+        .map_err(|e| PolyfillError::config(format!("Invalid proxy init code hash: {e}")))?;
+    let salt = keccak256(eoa_address);
+    Ok(factory.create2(salt, init_code_hash))
+}
+
+pub fn derive_safe_wallet(eoa_address: Address, chain_id: u64) -> Result<Address> {
+    if chain_id != 137 {
+        return Err(PolyfillError::config(
+            "Safe wallet auto-derivation is only configured for Polygon mainnet",
+        ));
+    }
+
+    let factory = Address::from_str(POLYGON_SAFE_FACTORY)
+        .map_err(|e| PolyfillError::config(format!("Invalid safe factory address: {e}")))?;
+    let init_code_hash = B256::from_str(SAFE_INIT_CODE_HASH)
+        .map_err(|e| PolyfillError::config(format!("Invalid safe init code hash: {e}")))?;
+    let mut padded = [0_u8; 32];
+    padded[12..].copy_from_slice(eoa_address.as_slice());
+    let salt = keccak256(padded);
+    Ok(factory.create2(salt, init_code_hash))
+}
+
+pub fn resolve_funder(
+    signer_address: Address,
+    chain_id: u64,
+    sig_type: SigType,
+    funder: Option<Address>,
+) -> Result<Option<Address>> {
+    match (sig_type, funder) {
+        (SigType::Eoa, Some(_)) => Err(PolyfillError::validation(
+            "funder cannot be set for EOA signature_type",
+        )),
+        (SigType::PolyProxy, None) => derive_proxy_wallet(signer_address, chain_id).map(Some),
+        (SigType::PolyGnosisSafe, None) => derive_safe_wallet(signer_address, chain_id).map(Some),
+        (SigType::Poly1271, None) => Err(PolyfillError::validation(
+            "funder is required for Poly1271 signature_type",
+        )),
+        (_, Some(Address::ZERO)) => Err(PolyfillError::validation("funder cannot be zero address")),
+        (_, explicit) => Ok(explicit),
     }
 }
 
@@ -578,6 +651,28 @@ mod tests {
         // Test unsupported chain
         let config_unsupported = get_contract_config(999, false);
         assert!(config_unsupported.is_none());
+    }
+
+    #[test]
+    fn test_signature_type_from_u8() {
+        assert_eq!(sig_type_from_u8(0).unwrap(), SigType::Eoa);
+        assert_eq!(sig_type_from_u8(1).unwrap(), SigType::PolyProxy);
+        assert_eq!(sig_type_from_u8(2).unwrap(), SigType::PolyGnosisSafe);
+        assert_eq!(sig_type_from_u8(3).unwrap(), SigType::Poly1271);
+        assert!(sig_type_from_u8(4).is_err());
+    }
+
+    #[test]
+    fn test_derive_polygon_funder_addresses() {
+        let eoa = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+        assert_eq!(
+            derive_safe_wallet(eoa, 137).unwrap(),
+            Address::from_str("0xd93b25Cb943D14d0d34FBAf01fc93a0F8b5f6e47").unwrap()
+        );
+        assert_eq!(
+            derive_proxy_wallet(eoa, 137).unwrap(),
+            Address::from_str("0x365f0cA36ae1F641E02Fe3b7743673DA42A13a70").unwrap()
+        );
     }
 
     #[test]

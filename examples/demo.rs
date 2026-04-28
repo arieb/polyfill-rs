@@ -100,6 +100,8 @@ impl PolyfillDemo {
             private_key: None,
             api_credentials: None,
             builder_code: None,
+            signature_type: None,
+            funder: None,
             timeout: Some(Duration::from_secs(30)),
             max_connections: Some(100),
         };

@@ -53,6 +53,13 @@ export POLYMARKET_PASSPHRASE="your_passphrase"
 export POLYMARKET_HOST="https://clob.polymarket.com"
 export POLYMARKET_CHAIN_ID="137"
 
+# Optional, but required when funds live in a Polymarket proxy/Safe wallet.
+# 0 = EOA, 1 = Proxy, 2 = Gnosis Safe/browser wallet, 3 = Poly1271.
+export POLYMARKET_SIGNATURE_TYPE="2"
+
+# Optional: override the derived funder/proxy wallet address.
+export POLYMARKET_FUNDER_ADDRESS="0x..."
+
 # Optional: pin clob.polymarket.com to a known A record if local DNS is blocked.
 # Keep the hostname in POLYMARKET_HOST so HTTPS/SNI still validates.
 export POLYMARKET_RESOLVE_IP="104.18.34.205"
