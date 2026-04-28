@@ -31,7 +31,10 @@ fn bootstrap_client(private_key: &str) -> ClobClient {
     .expect("failed to build bootstrap client")
 }
 
-fn authenticated_client(private_key: String, api_credentials: polyfill_rs::ApiCredentials) -> ClobClient {
+fn authenticated_client(
+    private_key: String,
+    api_credentials: polyfill_rs::ApiCredentials,
+) -> ClobClient {
     ClobClient::from_config(ClientConfig {
         base_url: HOST.to_string(),
         chain: CHAIN_ID,

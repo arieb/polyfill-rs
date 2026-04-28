@@ -5,20 +5,20 @@
 
 use crate::auth::{sign_order_message, SignedOrderMessage};
 use crate::errors::{PolyfillError, Result};
-use crate::types::{CreateOrderOptions, MarketOrderArgs, OrderArgs, OrderType, Side, SignedOrderRequest};
+use crate::types::{
+    CreateOrderOptions, MarketOrderArgs, OrderArgs, OrderType, Side, SignedOrderRequest,
+};
 use alloy_primitives::{Address, B256, U256};
 use alloy_signer_local::PrivateKeySigner;
 use rand::Rng;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::RoundingStrategy::{AwayFromZero, MidpointTowardZero, ToZero};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const BYTES32_ZERO: &str =
-    "0x0000000000000000000000000000000000000000000000000000000000000000";
+pub const BYTES32_ZERO: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Signature types for orders
 #[derive(Copy, Clone)]
@@ -133,7 +133,7 @@ fn parse_round_config(tick_size: Decimal) -> Result<&'static RoundConfig> {
         .ok_or_else(|| PolyfillError::validation(format!("Unsupported tick size {tick_size}")))
 }
 
-fn validate_bytes32_hex(field: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_bytes32_hex(field: &str, value: &str) -> Result<()> {
     if value == BYTES32_ZERO {
         return Ok(());
     }
@@ -176,39 +176,47 @@ pub fn adjust_buy_amount_for_fees(
     user_usdc_balance: Decimal,
     fee_rate: Decimal,
     fee_exponent: u32,
-    builder_taker_fee_rate_bps: Decimal,
+    builder_taker_fee_rate: Decimal,
 ) -> Result<Decimal> {
-    let price_f64 = price
-        .to_f64()
-        .ok_or_else(|| PolyfillError::validation(format!("Invalid price {price}")))?;
-    let amount_f64 = amount
-        .to_f64()
-        .ok_or_else(|| PolyfillError::validation(format!("Invalid amount {amount}")))?;
-    let user_balance_f64 = user_usdc_balance.to_f64().ok_or_else(|| {
-        PolyfillError::validation(format!("Invalid user_usdc_balance {user_usdc_balance}"))
-    })?;
-    let fee_rate_f64 = fee_rate
-        .to_f64()
-        .ok_or_else(|| PolyfillError::validation(format!("Invalid fee rate {fee_rate}")))?;
-    let builder_rate_f64 = builder_taker_fee_rate_bps
-        .to_f64()
-        .ok_or_else(|| PolyfillError::validation(format!(
-            "Invalid builder taker fee rate {builder_taker_fee_rate_bps}"
-        )))?
-        / 10_000.0;
+    if price <= Decimal::ZERO {
+        return Err(PolyfillError::validation(
+            "Market buy fee adjustment requires a positive price",
+        ));
+    }
 
-    let platform_fee_rate = fee_rate_f64 * (price_f64 * (1.0 - price_f64)).powi(fee_exponent as i32);
-    let platform_fee = (amount_f64 / price_f64) * platform_fee_rate;
-    let total_cost = amount_f64 + platform_fee + amount_f64 * builder_rate_f64;
+    let base = price * (Decimal::ONE - price);
+    let base_f64: f64 = base
+        .try_into()
+        .map_err(|_| PolyfillError::validation(format!("Invalid fee base {base}")))?;
+    let exp_f64: f64 = Decimal::from(fee_exponent)
+        .try_into()
+        .map_err(|_| PolyfillError::validation(format!("Invalid fee exponent {fee_exponent}")))?;
+    let platform_fee_rate = fee_rate
+        * Decimal::try_from(base_f64.powf(exp_f64)).map_err(|_| {
+            PolyfillError::validation(format!(
+                "Invalid platform fee rate for price {price} and exponent {fee_exponent}"
+            ))
+        })?;
 
-    let adjusted = if user_balance_f64 <= total_cost {
-        user_balance_f64 / (1.0 + platform_fee_rate / price_f64 + builder_rate_f64)
+    let platform_fee = amount / price * platform_fee_rate;
+    let total_cost = amount + platform_fee + amount * builder_taker_fee_rate;
+
+    let raw = if user_usdc_balance <= total_cost {
+        let divisor = Decimal::ONE + platform_fee_rate / price + builder_taker_fee_rate;
+        user_usdc_balance / divisor
     } else {
-        amount_f64
+        amount
     };
 
-    Decimal::from_f64(adjusted)
-        .ok_or_else(|| PolyfillError::validation("Adjusted market buy amount is out of range"))
+    let adjusted = raw.trunc_with_scale(6);
+    if adjusted.is_zero() {
+        return Err(PolyfillError::validation(format!(
+            "user_usdc_balance {user_usdc_balance} too small to cover fees at price {price}; \
+             fee-adjusted amount truncated to zero"
+        )));
+    }
+
+    Ok(adjusted)
 }
 
 impl OrderBuilder {
@@ -290,7 +298,8 @@ impl OrderBuilder {
         match side {
             Side::BUY => {
                 let raw_maker_amt = amount.round_dp_with_strategy(round_config.size, ToZero);
-                let raw_taker_amt = self.fix_amount_rounding(raw_maker_amt / raw_price, round_config);
+                let raw_taker_amt =
+                    self.fix_amount_rounding(raw_maker_amt / raw_price, round_config);
 
                 (
                     decimal_to_token_u32(raw_maker_amt),
@@ -299,7 +308,8 @@ impl OrderBuilder {
             },
             Side::SELL => {
                 let raw_maker_amt = amount.round_dp_with_strategy(round_config.size, ToZero);
-                let raw_taker_amt = self.fix_amount_rounding(raw_maker_amt * raw_price, round_config);
+                let raw_taker_amt =
+                    self.fix_amount_rounding(raw_maker_amt * raw_price, round_config);
 
                 (
                     decimal_to_token_u32(raw_maker_amt),
@@ -357,9 +367,9 @@ impl OrderBuilder {
             ));
         }
 
-        let tick_size = options.tick_size.ok_or_else(|| {
-            PolyfillError::validation("Cannot create order without tick size")
-        })?;
+        let tick_size = options
+            .tick_size
+            .ok_or_else(|| PolyfillError::validation("Cannot create order without tick size"))?;
         let round_config = parse_round_config(tick_size)?;
 
         let (maker_amount, taker_amount) =
@@ -396,9 +406,9 @@ impl OrderBuilder {
         order_args: &OrderArgs,
         options: &CreateOrderOptions,
     ) -> Result<SignedOrderRequest> {
-        let tick_size = options.tick_size.ok_or_else(|| {
-            PolyfillError::validation("Cannot create order without tick size")
-        })?;
+        let tick_size = options
+            .tick_size
+            .ok_or_else(|| PolyfillError::validation("Cannot create order without tick size"))?;
         let round_config = parse_round_config(tick_size)?;
 
         let (maker_amount, taker_amount) = self.get_order_amounts(
@@ -541,8 +551,14 @@ mod tests {
     fn test_get_contract_config() {
         // Test Polygon mainnet
         let config = get_contract_config(137, false).expect("polygon config");
-        assert_eq!(config.exchange, "0xE111180000d2663C0091e4f400237545B87B996B");
-        assert_eq!(config.collateral, "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+        assert_eq!(
+            config.exchange,
+            "0xE111180000d2663C0091e4f400237545B87B996B"
+        );
+        assert_eq!(
+            config.collateral,
+            "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+        );
         assert_eq!(
             config.conditional_tokens,
             "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -639,6 +655,36 @@ mod tests {
 
         assert_eq!(order.side, "BUY");
         assert!(!order.timestamp.is_empty());
+    }
+
+    #[test]
+    fn test_adjust_buy_amount_for_fees_uses_builder_rate_decimal() {
+        let adjusted = adjust_buy_amount_for_fees(
+            Decimal::from_str("100").unwrap(),
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("100").unwrap(),
+            Decimal::ZERO,
+            0,
+            Decimal::from_str("0.01").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(adjusted, Decimal::from_str("99.009900").unwrap());
+    }
+
+    #[test]
+    fn test_adjust_buy_amount_for_fees_rejects_zero_after_truncation() {
+        let err = adjust_buy_amount_for_fees(
+            Decimal::from_str("1").unwrap(),
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("0.0000009").unwrap(),
+            Decimal::ZERO,
+            0,
+            Decimal::ZERO,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PolyfillError::Validation { .. }));
     }
 
     #[test]

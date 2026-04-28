@@ -5,13 +5,11 @@
 
 use crate::auth::{create_l1_headers, create_l2_headers};
 use crate::errors::{PolyfillError, Result};
-use crate::http_config::{
-    create_colocated_client, create_internet_client, prewarm_connections,
-};
+use crate::http_config::{create_colocated_client, create_internet_client, prewarm_connections};
 use crate::types::{
-    CancelOrdersResponse, ClientConfig, ClobMarketInfo, CreateOrderOptions, MarketOrderArgs,
-    OrderArgs, OrderType, PostOrder, PostOrderOptions, PostOrderResponse, SignedOrderRequest,
-    Side,
+    BuilderFeeRateResponse, CancelOrdersResponse, ClientConfig, ClobMarketInfo, CreateOrderOptions,
+    MarketOrderArgs, OrderArgs, OrderType, PostOrder, PostOrderOptions, PostOrderResponse, Side,
+    SignedOrderRequest,
 };
 use alloy_primitives::U256;
 use alloy_signer_local::PrivateKeySigner;
@@ -96,7 +94,10 @@ impl ClobClient {
         });
 
         let connection_manager = Some(std::sync::Arc::new(
-            crate::connection_manager::ConnectionManager::new(http_client.clone(), host.to_string()),
+            crate::connection_manager::ConnectionManager::new(
+                http_client.clone(),
+                host.to_string(),
+            ),
         ));
         let buffer_pool = std::sync::Arc::new(crate::buffer_pool::BufferPool::new(512 * 1024, 10));
 
@@ -451,6 +452,41 @@ impl ClobClient {
 
         response
             .json::<ClobMarketInfo>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
+    }
+
+    /// Get V2 builder fee rates for a bytes32 builder code.
+    pub async fn get_builder_fee_rate(&self, builder_code: &str) -> Result<BuilderFeeRateResponse> {
+        crate::orders::validate_bytes32_hex("builder_code", builder_code)?;
+
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("Signer not set"))?;
+        let api_creds = self
+            .api_creds
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
+
+        let endpoint = format!("/fees/builder-fees/{builder_code}");
+        let headers = create_l2_headers::<Value>(signer, api_creds, "GET", &endpoint, None)?;
+        let req = self.create_request_with_headers(Method::GET, &endpoint, headers.into_iter());
+
+        let response = req.send().await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let message = if body.is_empty() {
+                "Failed to get builder fee rate".to_string()
+            } else {
+                format!("Failed to get builder fee rate: {body}")
+            };
+            return Err(PolyfillError::api(status, message));
+        }
+
+        response
+            .json::<BuilderFeeRateResponse>()
             .await
             .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
     }
@@ -974,12 +1010,21 @@ impl ClobClient {
 
         if order_args.side == Side::BUY {
             if let Some(user_balance) = order_args.user_usdc_balance {
-                let market_info = self.get_clob_market_info_for_token(&order_args.token_id).await?;
+                let market_info = self
+                    .get_clob_market_info_for_token(&order_args.token_id)
+                    .await?;
                 let fee_details = market_info.fd.unwrap_or(crate::types::ClobFeeDetails {
                     r: Decimal::ZERO,
                     e: 0,
                     to: false,
                 });
+                let builder_taker_fee_rate = match order_args.builder_code.as_deref() {
+                    Some(code) if code != crate::orders::BYTES32_ZERO => {
+                        let rate = self.get_builder_fee_rate(code).await?;
+                        Decimal::from(rate.builder_taker_fee_rate_bps) / Decimal::from(10_000_u32)
+                    },
+                    _ => Decimal::ZERO,
+                };
 
                 order_args.amount = crate::orders::adjust_buy_amount_for_fees(
                     order_args.amount,
@@ -987,11 +1032,7 @@ impl ClobClient {
                     user_balance,
                     fee_details.r,
                     fee_details.e,
-                    if order_args.builder_code.is_some() {
-                        market_info.tbf
-                    } else {
-                        Decimal::ZERO
-                    },
+                    builder_taker_fee_rate,
                 )?;
             }
         }
@@ -1027,6 +1068,17 @@ impl ClobClient {
         if options.post_only && matches!(options.order_type, OrderType::FOK | OrderType::FAK) {
             return Err(PolyfillError::validation(
                 "post_only is not supported for FOK/FAK orders",
+            ));
+        }
+        let expiration = order.expiration.parse::<u64>().map_err(|e| {
+            PolyfillError::validation(format!(
+                "Invalid order expiration '{}': {e}",
+                order.expiration
+            ))
+        })?;
+        if expiration > 0 && options.order_type != OrderType::GTD {
+            return Err(PolyfillError::validation(
+                "expiration is only supported for GTD orders",
             ));
         }
 
@@ -2362,8 +2414,7 @@ mod tests {
             base_url: base_url.to_string(),
             chain: 137,
             private_key: Some(
-                "0x1234567890123456789012345678901234567890123456789012345678901234"
-                    .to_string(),
+                "0x1234567890123456789012345678901234567890123456789012345678901234".to_string(),
             ),
             ..ClientConfig::default()
         })
@@ -2382,8 +2433,7 @@ mod tests {
             base_url: base_url.to_string(),
             chain: 137,
             private_key: Some(
-                "0x1234567890123456789012345678901234567890123456789012345678901234"
-                    .to_string(),
+                "0x1234567890123456789012345678901234567890123456789012345678901234".to_string(),
             ),
             api_credentials: Some(api_creds),
             ..ClientConfig::default()
@@ -2403,12 +2453,10 @@ mod tests {
             side: "BUY".to_string(),
             signature_type: 0,
             timestamp: "1713916800000".to_string(),
-            metadata:
-                "0x0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            builder:
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .to_string(),
+            metadata: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            builder: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
             signature: "0xdeadbeef".to_string(),
         }
     }
@@ -2441,8 +2489,7 @@ mod tests {
             base_url: "https://test.example.com".to_string(),
             chain: 137,
             private_key: Some(
-                "0x1234567890123456789012345678901234567890123456789012345678901234"
-                    .to_string(),
+                "0x1234567890123456789012345678901234567890123456789012345678901234".to_string(),
             ),
             api_credentials: Some(api_creds.clone()),
             ..ClientConfig::default()
@@ -3121,13 +3168,11 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(
                 r#"{
+                    "c":"0x1111111111111111111111111111111111111111111111111111111111111111",
                     "gst":"ready",
-                    "r":{},
                     "t":[{"t":"123","o":"YES"},{"t":"456","o":"NO"}],
                     "mos":"5",
                     "mts":"0.01",
-                    "mbf":"0",
-                    "tbf":"15",
                     "rfqe":true,
                     "itode":false,
                     "ibce":false,
@@ -3143,11 +3188,40 @@ mod tests {
         let info = client.get_clob_market_info("condition-1").await.unwrap();
 
         mock.assert_async().await;
+        assert_eq!(
+            info.c.as_deref(),
+            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
         assert_eq!(info.t.len(), 2);
         assert_eq!(info.mos, Decimal::from_str("5").unwrap());
         assert_eq!(info.mts, Decimal::from_str("0.01").unwrap());
-        assert_eq!(info.tbf, Decimal::from_str("15").unwrap());
+        assert_eq!(info.tbf, Decimal::ZERO);
         assert_eq!(info.fd.unwrap().e, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_builder_fee_rate_uses_v2_endpoint() {
+        let mut server = Server::new_async().await;
+        let builder_code = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mock = server
+            .mock("GET", format!("/fees/builder-fees/{builder_code}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "builder_maker_fee_rate_bps": 5,
+                    "builder_taker_fee_rate_bps": 12
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let response = client.get_builder_fee_rate(builder_code).await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(response.builder_maker_fee_rate_bps, 5);
+        assert_eq!(response.builder_taker_fee_rate_bps, 12);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3173,7 +3247,7 @@ mod tests {
                         "signature": "0xdeadbeef"
                     },
                     "owner": "test_key",
-                    "orderType": "GTC",
+                    "orderType": "GTD",
                     "postOnly": true,
                     "deferExec": true
                 })
@@ -3201,7 +3275,7 @@ mod tests {
             .post_order(
                 sample_signed_order(),
                 Some(&PostOrderOptions {
-                    order_type: OrderType::GTC,
+                    order_type: OrderType::GTD,
                     post_only: true,
                     defer_exec: true,
                 }),
@@ -3226,6 +3300,24 @@ mod tests {
                 Some(&PostOrderOptions {
                     order_type: OrderType::FAK,
                     post_only: true,
+                    defer_exec: false,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PolyfillError::Validation { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_order_rejects_expiration_for_non_gtd() {
+        let client = create_test_client_with_l2_auth("https://test.example.com");
+        let err = client
+            .post_order(
+                sample_signed_order(),
+                Some(&PostOrderOptions {
+                    order_type: OrderType::GTC,
+                    post_only: false,
                     defer_exec: false,
                 }),
             )

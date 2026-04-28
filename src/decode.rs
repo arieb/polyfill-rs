@@ -186,6 +186,16 @@ pub mod deserializers {
             serde::de::Error::custom("Expected decimal as string/number, got null/empty string")
         })
     }
+
+    /// Deserialize a Decimal from string/number/null, defaulting missing-ish values to zero.
+    pub fn decimal_from_string_or_zero<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Decimal, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(optional_decimal_from_string(deserializer)?.unwrap_or(Decimal::ZERO))
+    }
 }
 
 /// Raw API response types for efficient parsing

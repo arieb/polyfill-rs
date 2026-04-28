@@ -8,7 +8,9 @@
 #![cfg(feature = "stream")]
 
 use futures::StreamExt;
-use polyfill_rs::{ClientConfig, ClobClient, OrderBookManager, WebSocketStream, WsBookUpdateProcessor};
+use polyfill_rs::{
+    ClientConfig, ClobClient, OrderBookManager, WebSocketStream, WsBookUpdateProcessor,
+};
 use std::env;
 use std::time::Duration;
 

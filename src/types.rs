@@ -669,6 +669,7 @@ pub struct ClobTokenInfo {
 /// Fee details returned by `GET /clob-markets/{condition_id}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClobFeeDetails {
+    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
     pub r: Decimal,
     pub e: u32,
     #[serde(default)]
@@ -679,16 +680,32 @@ pub struct ClobFeeDetails {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClobMarketInfo {
     #[serde(default)]
+    pub c: Option<String>,
+    #[serde(default)]
     pub gst: Option<String>,
+    #[serde(default)]
     pub r: serde_json::Value,
+    #[serde(default)]
     pub t: Vec<ClobTokenInfo>,
-    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::decimal_from_string_or_zero"
+    )]
     pub mos: Decimal,
-    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::decimal_from_string_or_zero"
+    )]
     pub mts: Decimal,
-    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::decimal_from_string_or_zero"
+    )]
     pub mbf: Decimal,
-    #[serde(deserialize_with = "crate::decode::deserializers::decimal_from_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::decimal_from_string_or_zero"
+    )]
     pub tbf: Decimal,
     #[serde(default)]
     pub rfqe: bool,
@@ -700,8 +717,21 @@ pub struct ClobMarketInfo {
     pub nr: Option<bool>,
     #[serde(default)]
     pub fd: Option<ClobFeeDetails>,
-    #[serde(default, deserialize_with = "crate::decode::deserializers::optional_number_from_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::optional_number_from_string"
+    )]
     pub oas: Option<u64>,
+}
+
+/// Builder fee response returned by `GET /fees/builder-fees/{builder_code}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuilderFeeRateResponse {
+    #[serde(alias = "builder_maker_fee_rate_bps")]
+    pub builder_maker_fee_rate_bps: u32,
+    #[serde(alias = "builder_taker_fee_rate_bps")]
+    pub builder_taker_fee_rate_bps: u32,
 }
 
 /// Market information
