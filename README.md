@@ -32,7 +32,7 @@ use polyfill_rs::{ClobClient, Side, OrderType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ClobClient::new("https://clob-v2.polymarket.com");
+    let client = ClobClient::new("https://clob.polymarket.com");
     let markets = client.get_sampling_markets(None).await?;
     println!("Found {} markets", markets.data.len());
     Ok(())

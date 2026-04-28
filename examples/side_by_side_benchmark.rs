@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=20 {
         let start = Instant::now();
         match baseline_http
-            .get("https://clob-v2.polymarket.com/simplified-markets?next_cursor=MA==")
+            .get("https://clob.polymarket.com/simplified-markets?next_cursor=MA==")
             .send()
             .await
         {
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Test 2: polyfill-rs (with keep-alive)");
     println!("══════════════════════════════════════");
 
-    let our_client = polyfill_rs::ClobClient::new("https://clob-v2.polymarket.com");
+    let our_client = polyfill_rs::ClobClient::new("https://clob.polymarket.com");
     our_client
         .start_keepalive(std::time::Duration::from_secs(30))
         .await;

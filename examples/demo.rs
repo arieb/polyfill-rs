@@ -95,7 +95,7 @@ impl PolyfillDemo {
     pub fn new() -> Result<Self> {
         // Create basic client
         let config = ClientConfig {
-            base_url: "https://clob-v2.polymarket.com".to_string(),
+            base_url: "https://clob.polymarket.com".to_string(),
             chain: 137,
             private_key: None,
             api_credentials: None,

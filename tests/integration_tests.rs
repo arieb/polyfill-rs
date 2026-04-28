@@ -6,7 +6,7 @@ use polyfill_rs::{ClientConfig, ClobClient, OrderArgs, Side};
 use rust_decimal_macros::dec;
 use std::env;
 
-const HOST: &str = "https://clob-v2.polymarket.com";
+const HOST: &str = "https://clob.polymarket.com";
 const CHAIN_ID: u64 = 137;
 
 fn load_env_vars() -> (String, Option<String>, Option<String>, Option<String>) {

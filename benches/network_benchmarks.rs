@@ -11,7 +11,7 @@ fn benchmark_real_simplified_markets(c: &mut Criterion) {
     c.bench_function("real_fetch_simplified_markets", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let client = ClobClient::new("https://clob-v2.polymarket.com");
+                let client = ClobClient::new("https://clob.polymarket.com");
 
                 // This is the real network request + JSON parsing
                 let result = client.get_sampling_simplified_markets(None).await;
@@ -28,7 +28,7 @@ fn benchmark_real_markets(c: &mut Criterion) {
     c.bench_function("real_fetch_markets", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let client = ClobClient::new("https://clob-v2.polymarket.com");
+                let client = ClobClient::new("https://clob.polymarket.com");
 
                 // This is the real network request + JSON parsing
                 let result = client.get_sampling_markets(None).await;
@@ -52,7 +52,7 @@ fn benchmark_real_order_creation(c: &mut Criterion) {
     c.bench_function("real_create_order_eip712", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let client = ClobClient::new("https://clob-v2.polymarket.com");
+                let client = ClobClient::new("https://clob.polymarket.com");
 
                 // Set up credentials
                 if let Ok(_key) = std::env::var("POLYMARKET_PRIVATE_KEY") {

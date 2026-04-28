@@ -14,7 +14,7 @@ use polyfill_rs::{
 use std::env;
 use std::time::Duration;
 
-const HOST: &str = "https://clob-v2.polymarket.com";
+const HOST: &str = "https://clob.polymarket.com";
 const WS_MARKET_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const WS_USER_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const CHAIN_ID: u64 = 137;

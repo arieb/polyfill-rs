@@ -4,7 +4,7 @@ use std::env;
 
 fn build_bootstrap_client(private_key: &str) -> ClobClient {
     ClobClient::from_config(ClientConfig {
-        base_url: "https://clob-v2.polymarket.com".to_string(),
+        base_url: "https://clob.polymarket.com".to_string(),
         chain: 137,
         private_key: Some(private_key.to_string()),
         ..ClientConfig::default()
@@ -30,7 +30,7 @@ async fn test_create_api_key_simple() {
             println!("Successfully created/derived API key");
             println!("  API Key created (len={})", creds.api_key.len());
             let client = ClobClient::from_config(ClientConfig {
-                base_url: "https://clob-v2.polymarket.com".to_string(),
+                base_url: "https://clob.polymarket.com".to_string(),
                 chain: 137,
                 private_key: Some(private_key),
                 api_credentials: Some(creds),
@@ -77,7 +77,7 @@ async fn test_get_api_keys() {
         .await
         .expect("Failed to create API key");
     let client = ClobClient::from_config(ClientConfig {
-        base_url: "https://clob-v2.polymarket.com".to_string(),
+        base_url: "https://clob.polymarket.com".to_string(),
         chain: 137,
         private_key: Some(private_key),
         api_credentials: Some(creds),
@@ -118,7 +118,7 @@ async fn test_get_trades() {
         .await
         .expect("Failed to create API key");
     let client = ClobClient::from_config(ClientConfig {
-        base_url: "https://clob-v2.polymarket.com".to_string(),
+        base_url: "https://clob.polymarket.com".to_string(),
         chain: 137,
         private_key: Some(private_key),
         api_credentials: Some(creds),
@@ -159,7 +159,7 @@ async fn test_get_notifications() {
         .await
         .expect("Failed to create API key");
     let client = ClobClient::from_config(ClientConfig {
-        base_url: "https://clob-v2.polymarket.com".to_string(),
+        base_url: "https://clob.polymarket.com".to_string(),
         chain: 137,
         private_key: Some(private_key),
         api_credentials: Some(creds),

@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Benchmark with Keep-Alive Enabled");
     println!("==================================\n");
 
-    let client = ClobClient::new("https://clob-v2.polymarket.com");
+    let client = ClobClient::new("https://clob.polymarket.com");
 
     // Start keep-alive
     println!("Starting keep-alive...");

@@ -13,7 +13,7 @@ async fn test_post_order_authentication() {
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
 
     let bootstrap = ClobClient::from_config(ClientConfig {
-        base_url: "https://clob-v2.polymarket.com".to_string(),
+        base_url: "https://clob.polymarket.com".to_string(),
         chain: 137,
         private_key: Some(private_key.clone()),
         ..ClientConfig::default()
@@ -26,7 +26,7 @@ async fn test_post_order_authentication() {
         .await
         .expect("Failed to create API key");
     let client = ClobClient::from_config(ClientConfig {
-        base_url: "https://clob-v2.polymarket.com".to_string(),
+        base_url: "https://clob.polymarket.com".to_string(),
         chain: 137,
         private_key: Some(private_key),
         api_credentials: Some(creds),

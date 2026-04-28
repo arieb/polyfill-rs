@@ -20,7 +20,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let bootstrap = ClobClient::from_config(ClientConfig {
-//!         base_url: "https://clob-v2.polymarket.com".to_string(),
+//!         base_url: "https://clob.polymarket.com".to_string(),
 //!         chain: 137,
 //!         private_key: Some("your_private_key".to_string()),
 //!         ..ClientConfig::default()
@@ -28,7 +28,7 @@
 //!
 //!     let api_creds = bootstrap.create_or_derive_api_key(None).await?;
 //!     let client = ClobClient::from_config(ClientConfig {
-//!         base_url: "https://clob-v2.polymarket.com".to_string(),
+//!         base_url: "https://clob.polymarket.com".to_string(),
 //!         chain: 137,
 //!         private_key: Some("your_private_key".to_string()),
 //!         api_credentials: Some(api_creds),
@@ -59,7 +59,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create a basic client
-//!     let client = ClobClient::new("https://clob-v2.polymarket.com");
+//!     let client = ClobClient::new("https://clob.polymarket.com");
 //!
 //!     // Get market data
 //!     let markets = client.get_sampling_markets(None).await.unwrap();
@@ -77,7 +77,7 @@ use tracing::info;
 
 // Global constants
 pub const DEFAULT_CHAIN_ID: u64 = 137; // Polygon
-pub const DEFAULT_BASE_URL: &str = "https://clob-v2.polymarket.com";
+pub const DEFAULT_BASE_URL: &str = "https://clob.polymarket.com";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;

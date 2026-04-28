@@ -815,7 +815,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://clob-v2.polymarket.com".to_string(),
+            base_url: "https://clob.polymarket.com".to_string(),
             chain: 137, // Polygon mainnet
             private_key: None,
             api_credentials: None,

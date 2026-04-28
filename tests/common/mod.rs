@@ -20,7 +20,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             host: env::var("POLYMARKET_HOST")
-                .unwrap_or_else(|_| "https://clob-v2.polymarket.com".to_string()),
+                .unwrap_or_else(|_| "https://clob.polymarket.com".to_string()),
             chain: env::var("POLYMARKET_CHAIN_ID")
                 .unwrap_or_else(|_| "137".to_string())
                 .parse()
