@@ -91,16 +91,21 @@ pub struct ClobClient {
     buffer_pool: std::sync::Arc<crate::buffer_pool::BufferPool>,
 }
 
+#[derive(Default)]
+struct ClientAuthConfig {
+    signer: Option<PrivateKeySigner>,
+    api_creds: Option<ApiCreds>,
+    builder_code: Option<String>,
+    sig_type: Option<crate::orders::SigType>,
+    funder: Option<Address>,
+}
+
 impl ClobClient {
     fn build_client(
         host: &str,
         chain_id: u64,
         http_client: Client,
-        signer: Option<PrivateKeySigner>,
-        api_creds: Option<ApiCreds>,
-        builder_code: Option<String>,
-        sig_type: Option<crate::orders::SigType>,
-        funder: Option<Address>,
+        auth: ClientAuthConfig,
     ) -> Self {
         let dns_cache = tokio::runtime::Handle::try_current().ok().and_then(|_| {
             tokio::task::block_in_place(|| {
@@ -132,17 +137,18 @@ impl ClobClient {
             });
         }
 
-        let order_builder = signer
+        let order_builder = auth
+            .signer
             .clone()
-            .map(|signer| crate::orders::OrderBuilder::new(signer, sig_type, funder));
+            .map(|signer| crate::orders::OrderBuilder::new(signer, auth.sig_type, auth.funder));
 
         Self {
             http_client,
             base_url: host.to_string(),
             chain_id,
-            signer,
-            api_creds,
-            builder_code,
+            signer: auth.signer,
+            api_creds: auth.api_creds,
+            builder_code: auth.builder_code,
             order_builder,
             dns_cache,
             connection_manager,
@@ -154,7 +160,7 @@ impl ClobClient {
     /// Now includes DNS caching, connection management, and buffer pooling
     pub fn new(host: &str) -> Self {
         let http_client = build_http_client(host, None, None);
-        Self::build_client(host, 137, http_client, None, None, None, None, None)
+        Self::build_client(host, 137, http_client, ClientAuthConfig::default())
     }
 
     /// Create a V2-native client from config.
@@ -195,11 +201,13 @@ impl ClobClient {
             &config.base_url,
             config.chain,
             http_client,
-            signer,
-            config.api_credentials,
-            config.builder_code,
-            sig_type,
-            funder,
+            ClientAuthConfig {
+                signer,
+                api_creds: config.api_credentials,
+                builder_code: config.builder_code,
+                sig_type,
+                funder,
+            },
         ))
     }
 
@@ -211,7 +219,7 @@ impl ClobClient {
                 .build()
                 .expect("Failed to build reqwest client")
         });
-        Self::build_client(host, 137, http_client, None, None, None, None, None)
+        Self::build_client(host, 137, http_client, ClientAuthConfig::default())
     }
 
     /// Create a client optimized for internet connections
@@ -222,7 +230,7 @@ impl ClobClient {
                 .build()
                 .expect("Failed to build reqwest client")
         });
-        Self::build_client(host, 137, http_client, None, None, None, None, None)
+        Self::build_client(host, 137, http_client, ClientAuthConfig::default())
     }
 
     /// Create a client with L1 headers (for authentication)
