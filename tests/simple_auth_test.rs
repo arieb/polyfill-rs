@@ -1,6 +1,16 @@
 // Simple authentication test to verify HMAC works
-use polyfill_rs::ClobClient;
+use polyfill_rs::{ClientConfig, ClobClient};
 use std::env;
+
+fn build_bootstrap_client(private_key: &str) -> ClobClient {
+    ClobClient::from_config(ClientConfig {
+        base_url: "https://clob.polymarket.com".to_string(),
+        chain: 137,
+        private_key: Some(private_key.to_string()),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build bootstrap client")
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -10,16 +20,23 @@ async fn test_create_api_key_simple() {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
 
-    let mut client = ClobClient::with_l1_headers("https://clob.polymarket.com", &private_key, 137);
+    let bootstrap = build_bootstrap_client(&private_key);
 
     println!("Step 1: Creating/deriving API key...");
-    let result = client.create_or_derive_api_key(None).await;
+    let result = bootstrap.create_or_derive_api_key(None).await;
 
     match result {
         Ok(creds) => {
             println!("Successfully created/derived API key");
             println!("  API Key created (len={})", creds.api_key.len());
-            client.set_api_creds(creds);
+            let client = ClobClient::from_config(ClientConfig {
+                base_url: "https://clob.polymarket.com".to_string(),
+                chain: 137,
+                private_key: Some(private_key),
+                api_credentials: Some(creds),
+                ..ClientConfig::default()
+            })
+            .expect("failed to build authenticated client");
 
             // Now try to get orders (requires auth)
             println!("\nStep 2: Testing authenticated endpoint (get_orders)...");
@@ -53,13 +70,20 @@ async fn test_get_api_keys() {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
 
-    let mut client = ClobClient::with_l1_headers("https://clob.polymarket.com", &private_key, 137);
+    let bootstrap = build_bootstrap_client(&private_key);
 
-    let creds = client
+    let creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create API key");
-    client.set_api_creds(creds);
+    let client = ClobClient::from_config(ClientConfig {
+        base_url: "https://clob.polymarket.com".to_string(),
+        chain: 137,
+        private_key: Some(private_key),
+        api_credentials: Some(creds),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client");
 
     println!("Testing get_api_keys (requires HMAC auth)...");
     let result = client.get_api_keys().await;
@@ -87,13 +111,20 @@ async fn test_get_trades() {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
 
-    let mut client = ClobClient::with_l1_headers("https://clob.polymarket.com", &private_key, 137);
+    let bootstrap = build_bootstrap_client(&private_key);
 
-    let creds = client
+    let creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create API key");
-    client.set_api_creds(creds);
+    let client = ClobClient::from_config(ClientConfig {
+        base_url: "https://clob.polymarket.com".to_string(),
+        chain: 137,
+        private_key: Some(private_key),
+        api_credentials: Some(creds),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client");
 
     println!("Testing get_trades (requires HMAC auth)...");
     let result = client.get_trades(None, None).await;
@@ -121,13 +152,20 @@ async fn test_get_notifications() {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
 
-    let mut client = ClobClient::with_l1_headers("https://clob.polymarket.com", &private_key, 137);
+    let bootstrap = build_bootstrap_client(&private_key);
 
-    let creds = client
+    let creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create API key");
-    client.set_api_creds(creds);
+    let client = ClobClient::from_config(ClientConfig {
+        base_url: "https://clob.polymarket.com".to_string(),
+        chain: 137,
+        private_key: Some(private_key),
+        api_credentials: Some(creds),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client");
 
     println!("Testing get_notifications (requires HMAC auth)...");
     let result = client.get_notifications().await;

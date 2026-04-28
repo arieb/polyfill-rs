@@ -2,7 +2,7 @@
 // These tests hit the real Polymarket API and are ignored by default
 // Run with: cargo test --test integration_tests -- --ignored --test-threads=1
 
-use polyfill_rs::{ClobClient, OrderArgs, Side};
+use polyfill_rs::{ClientConfig, ClobClient, OrderArgs, Side};
 use rust_decimal_macros::dec;
 use std::env;
 
@@ -15,10 +15,54 @@ fn load_env_vars() -> (String, Option<String>, Option<String>, Option<String>) {
     let private_key =
         env::var("POLYMARKET_PRIVATE_KEY").expect("POLYMARKET_PRIVATE_KEY must be set in .env");
     let api_key = env::var("POLYMARKET_API_KEY").ok();
-    let api_secret = env::var("POLYMARKET_API_SECRET").ok();
-    let api_passphrase = env::var("POLYMARKET_API_PASSPHRASE").ok();
+    let api_secret = env::var("POLYMARKET_API_SECRET")
+        .or_else(|_| env::var("POLYMARKET_SECRET"))
+        .ok();
+    let api_passphrase = env::var("POLYMARKET_API_PASSPHRASE")
+        .or_else(|_| env::var("POLYMARKET_PASSPHRASE"))
+        .ok();
 
     (private_key, api_key, api_secret, api_passphrase)
+}
+
+fn env_signature_type() -> Option<u8> {
+    env::var("POLYMARKET_SIGNATURE_TYPE")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+}
+
+fn env_funder() -> Option<String> {
+    env::var("POLYMARKET_FUNDER")
+        .or_else(|_| env::var("POLYMARKET_FUNDER_ADDRESS"))
+        .ok()
+}
+
+fn bootstrap_client(private_key: &str) -> ClobClient {
+    ClobClient::from_config(ClientConfig {
+        base_url: HOST.to_string(),
+        chain: CHAIN_ID,
+        private_key: Some(private_key.to_string()),
+        signature_type: env_signature_type(),
+        funder: env_funder(),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build bootstrap client")
+}
+
+fn authenticated_client(
+    private_key: String,
+    api_credentials: polyfill_rs::ApiCredentials,
+) -> ClobClient {
+    ClobClient::from_config(ClientConfig {
+        base_url: HOST.to_string(),
+        chain: CHAIN_ID,
+        private_key: Some(private_key),
+        api_credentials: Some(api_credentials),
+        signature_type: env_signature_type(),
+        funder: env_funder(),
+        ..ClientConfig::default()
+    })
+    .expect("failed to build authenticated client")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -26,7 +70,7 @@ fn load_env_vars() -> (String, Option<String>, Option<String>, Option<String>) {
 async fn test_real_api_create_derive_api_key() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let client = bootstrap_client(&private_key);
 
     // Test creating/deriving API key
     let result = client.create_or_derive_api_key(None).await;
@@ -50,15 +94,15 @@ async fn test_real_api_authenticated_order_flow() {
     let (private_key, _, _, _) = load_env_vars();
 
     // Initialize client with L1 headers
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let bootstrap = bootstrap_client(&private_key);
 
     // Step 1: Create/derive API credentials
     println!("Step 1: Creating/deriving API credentials...");
-    let api_creds = client
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
     println!("PASS: API credentials set");
 
     // Step 2: Get a valid token_id from active markets
@@ -68,43 +112,55 @@ async fn test_real_api_authenticated_order_flow() {
         .await
         .expect("Failed to get markets");
 
-    let active_market = markets
-        .data
-        .iter()
-        .find(|m| m.active && !m.closed)
-        .expect("No active markets found");
+    let mut selected_token = None;
+    let mut selected_midpoint = None;
+    for market in markets.data.iter().filter(|m| m.active && !m.closed) {
+        for token in &market.tokens {
+            let midpoint = match client.get_midpoint(&token.token_id).await {
+                Ok(midpoint) => midpoint.mid,
+                Err(_) => continue,
+            };
+            if midpoint > dec!(0.05) {
+                selected_token = Some(token.token_id.clone());
+                selected_midpoint = Some(midpoint);
+                break;
+            }
+        }
+        if selected_token.is_some() {
+            break;
+        }
+    }
 
-    let token_id = &active_market.tokens[0].token_id;
+    let token_id = selected_token.expect("No active token with midpoint safely above 0.01 found");
+    let midpoint = selected_midpoint.expect("midpoint should be selected with token");
     println!("PASS: Found active token: {}", token_id);
+    println!("PASS: Current midpoint: {}", midpoint);
 
-    // Step 3: Get current price to place a reasonable order
-    println!("Step 3: Getting current market price...");
-    let midpoint = client
-        .get_midpoint(token_id)
+    // Step 4: Create and post a tiny non-marketable BUY order.
+    // A BUY at 0.01 validates pUSD balance/allowance without requiring outcome-token inventory.
+    let side = Side::BUY;
+    let order_price = dec!(0.01);
+    let order_book = client
+        .get_order_book(&token_id)
         .await
-        .expect("Failed to get midpoint");
-    println!("PASS: Current midpoint: {}", midpoint.mid);
-
-    // Step 4: Create and post a small order well away from market price (so it won't fill immediately).
-    // IMPORTANT: choose side consistently with the price so we don't accidentally create a marketable order.
-    let (side, order_price) = if midpoint.mid > dec!(0.5) {
-        (Side::BUY, dec!(0.01)) // Very low buy price, won't fill
-    } else {
-        (Side::SELL, dec!(0.99)) // Very high sell price, won't fill
-    };
+        .expect("Failed to get selected order book");
+    let order_size = order_book.min_order_size.max(dec!(5));
 
     println!(
-        "Step 4: Posting {:?} order at price {}...",
-        side, order_price
+        "Step 4: Posting {:?} order at price {} and size {}...",
+        side, order_price, order_size
     );
     let order_args = OrderArgs {
-        token_id: token_id.clone(),
+        token_id,
         price: order_price,
-        size: dec!(1.0), // Small size (auth is the thing we're testing here)
+        size: order_size,
         side,
+        expiration: None,
+        builder_code: None,
+        metadata: None,
     };
 
-    let post_result = client.create_and_post_order(&order_args).await;
+    let post_result = client.create_and_post_order(&order_args, None, None).await;
 
     // This is the critical test - did we get past the 401 error?
     match &post_result {
@@ -156,12 +212,12 @@ async fn test_real_api_authenticated_order_flow() {
 async fn test_real_api_get_orders() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_orders...");
     let result = client.get_orders(None, None).await;
@@ -186,12 +242,12 @@ async fn test_real_api_get_orders() {
 async fn test_real_api_get_trades() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_trades...");
     let result = client.get_trades(None, None).await;
@@ -215,14 +271,58 @@ async fn test_real_api_get_trades() {
 async fn test_real_api_get_balance_allowance() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_balance_allowance...");
+
+    use polyfill_rs::types::{AssetType, BalanceAllowanceParams};
+    let collateral_update_params = BalanceAllowanceParams {
+        asset_type: Some(AssetType::COLLATERAL),
+        token_id: None,
+        signature_type: None,
+    };
+    let collateral_update = client
+        .update_balance_allowance(Some(collateral_update_params))
+        .await;
+    match collateral_update {
+        Ok(update) => {
+            println!("PASS: Successfully requested collateral balance/allowance update");
+            println!("  Collateral update: {:?}", update);
+        },
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            if err_str.contains("401") {
+                panic!("FAIL: 401 Unauthorized - authentication failed!");
+            }
+            println!("WARNING: Collateral balance update failed: {:?}", e);
+        },
+    }
+
+    let collateral_params = BalanceAllowanceParams {
+        asset_type: Some(AssetType::COLLATERAL),
+        token_id: None,
+        signature_type: None,
+    };
+    let collateral_result = client.get_balance_allowance(Some(collateral_params)).await;
+
+    match collateral_result {
+        Ok(balance) => {
+            println!("PASS: Successfully fetched collateral balance/allowance");
+            println!("  Collateral: {:?}", balance);
+        },
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            if err_str.contains("401") {
+                panic!("FAIL: 401 Unauthorized - authentication failed!");
+            }
+            println!("WARNING: Collateral balance check failed: {:?}", e);
+        },
+    }
 
     // Get a valid token_id first
     let markets = client
@@ -231,7 +331,6 @@ async fn test_real_api_get_balance_allowance() {
         .expect("Failed to get markets");
     let token_id = &markets.data[0].tokens[0].token_id;
 
-    use polyfill_rs::types::{AssetType, BalanceAllowanceParams};
     let params = BalanceAllowanceParams {
         asset_type: Some(AssetType::CONDITIONAL),
         token_id: Some(token_id.clone()),
@@ -260,12 +359,12 @@ async fn test_real_api_get_balance_allowance() {
 async fn test_real_api_get_api_keys() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_api_keys...");
     let result = client.get_api_keys().await;
@@ -290,12 +389,12 @@ async fn test_real_api_get_api_keys() {
 async fn test_real_api_get_notifications() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let mut client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
-    let api_creds = client
+    let bootstrap = bootstrap_client(&private_key);
+    let api_creds = bootstrap
         .create_or_derive_api_key(None)
         .await
         .expect("Failed to create/derive API key");
-    client.set_api_creds(api_creds);
+    let client = authenticated_client(private_key, api_creds);
 
     println!("Testing get_notifications...");
     let result = client.get_notifications().await;
@@ -320,7 +419,7 @@ async fn test_real_api_get_notifications() {
 async fn test_real_api_market_data_endpoints() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let client = bootstrap_client(&private_key);
 
     println!("Testing market data endpoints (no auth required)...");
 
@@ -387,7 +486,7 @@ async fn test_real_api_market_data_endpoints() {
 async fn test_real_api_batch_endpoints() {
     let (private_key, _, _, _) = load_env_vars();
 
-    let client = ClobClient::with_l1_headers(HOST, &private_key, CHAIN_ID);
+    let client = bootstrap_client(&private_key);
 
     println!("Testing batch endpoints...");
 

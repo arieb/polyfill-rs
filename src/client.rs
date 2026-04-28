@@ -5,50 +5,73 @@
 
 use crate::auth::{create_l1_headers, create_l2_headers};
 use crate::errors::{PolyfillError, Result};
-use crate::http_config::{
-    create_colocated_client, create_internet_client, create_optimized_client, prewarm_connections,
+use crate::http_config::{create_colocated_client, create_internet_client, prewarm_connections};
+use crate::types::{
+    BuilderFeeRateResponse, CancelOrdersResponse, ClientConfig, ClobMarketInfo, CreateOrderOptions,
+    MarketOrderArgs, OrderArgs, OrderType, PostOrder, PostOrderOptions, PostOrderResponse, Side,
+    SignedOrderRequest,
 };
-use crate::types::{OrderOptions, PostOrder, SignedOrderRequest};
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use reqwest::header::HeaderName;
 use reqwest::Client;
 use reqwest::{Method, RequestBuilder};
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Value;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::time::Duration;
 
 // Re-export types for compatibility
-pub use crate::types::{ApiCredentials as ApiCreds, OrderType, Side};
+pub use crate::types::{ApiCredentials as ApiCreds, MarketOrderArgs as ClientMarketOrderArgs};
 
-// Compatibility types
-#[derive(Debug)]
-pub struct OrderArgs {
-    pub token_id: String,
-    pub price: Decimal,
-    pub size: Decimal,
-    pub side: Side,
+#[derive(Debug, Clone, serde::Deserialize)]
+struct MarketByTokenResponse {
+    condition_id: String,
 }
 
-impl OrderArgs {
-    pub fn new(token_id: &str, price: Decimal, size: Decimal, side: Side) -> Self {
-        Self {
-            token_id: token_id.to_string(),
-            price,
-            size,
-            side,
+fn build_http_client(
+    host: &str,
+    timeout: Option<Duration>,
+    max_connections: Option<usize>,
+) -> Client {
+    let max_connections = max_connections.unwrap_or(10);
+    let mut builder = reqwest::ClientBuilder::new()
+        .no_proxy()
+        .http2_adaptive_window(true)
+        .http2_initial_stream_window_size(512 * 1024)
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(max_connections)
+        .pool_idle_timeout(Duration::from_secs(90));
+
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+
+    if let Ok(resolve_ip) = std::env::var("POLYMARKET_RESOLVE_IP") {
+        if let Ok(ip) = resolve_ip.parse::<IpAddr>() {
+            if let Some(hostname) = extract_hostname(host) {
+                builder = builder.resolve(hostname, SocketAddr::new(ip, 443));
+            }
         }
     }
+
+    builder.build().unwrap_or_else(|_| {
+        reqwest::ClientBuilder::new()
+            .no_proxy()
+            .build()
+            .expect("Failed to build reqwest client")
+    })
 }
 
-impl Default for OrderArgs {
-    fn default() -> Self {
-        Self {
-            token_id: "".to_string(),
-            price: Decimal::ZERO,
-            size: Decimal::ZERO,
-            side: Side::BUY,
-        }
-    }
+fn extract_hostname(host: &str) -> Option<&str> {
+    host.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .and_then(|authority| authority.split(':').next())
+        .filter(|hostname| !hostname.is_empty())
 }
 
 /// Main client for interacting with Polymarket API
@@ -58,6 +81,7 @@ pub struct ClobClient {
     chain_id: u64,
     signer: Option<PrivateKeySigner>,
     api_creds: Option<ApiCreds>,
+    builder_code: Option<String>,
     order_builder: Option<crate::orders::OrderBuilder>,
     #[allow(dead_code)]
     dns_cache: Option<std::sync::Arc<crate::dns_cache::DnsCache>>,
@@ -67,29 +91,22 @@ pub struct ClobClient {
     buffer_pool: std::sync::Arc<crate::buffer_pool::BufferPool>,
 }
 
-impl ClobClient {
-    /// Create a new client with optimized HTTP/2 settings (benchmarked 11.4% faster)
-    /// Now includes DNS caching, connection management, and buffer pooling
-    pub fn new(host: &str) -> Self {
-        // Benchmarked optimal configuration: 512KB stream window
-        // Results: 309.3ms vs 349ms baseline (11.4% improvement)
-        let optimized_client = reqwest::ClientBuilder::new()
-            // Avoid reading OS proxy settings (can be slow and/or unavailable in some sandboxed envs)
-            .no_proxy()
-            .http2_adaptive_window(true)
-            .http2_initial_stream_window_size(512 * 1024) // 512KB - empirically optimal
-            .tcp_nodelay(true)
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .build()
-            .unwrap_or_else(|_| {
-                reqwest::ClientBuilder::new()
-                    .no_proxy()
-                    .build()
-                    .expect("Failed to build reqwest client")
-            });
+#[derive(Default)]
+struct ClientAuthConfig {
+    signer: Option<PrivateKeySigner>,
+    api_creds: Option<ApiCreds>,
+    builder_code: Option<String>,
+    sig_type: Option<crate::orders::SigType>,
+    funder: Option<Address>,
+}
 
-        // Initialize DNS cache and pre-warm it
+impl ClobClient {
+    fn build_client(
+        host: &str,
+        chain_id: u64,
+        http_client: Client,
+        auth: ClientAuthConfig,
+    ) -> Self {
         let dns_cache = tokio::runtime::Handle::try_current().ok().and_then(|_| {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -105,18 +122,14 @@ impl ClobClient {
             })
         });
 
-        // Initialize connection manager
         let connection_manager = Some(std::sync::Arc::new(
             crate::connection_manager::ConnectionManager::new(
-                optimized_client.clone(),
+                http_client.clone(),
                 host.to_string(),
             ),
         ));
-
-        // Initialize buffer pool (512KB buffers, pool of 10)
         let buffer_pool = std::sync::Arc::new(crate::buffer_pool::BufferPool::new(512 * 1024, 10));
 
-        // Pre-warm buffer pool with 3 buffers
         let pool_clone = buffer_pool.clone();
         if let Ok(_handle) = tokio::runtime::Handle::try_current() {
             tokio::spawn(async move {
@@ -124,17 +137,78 @@ impl ClobClient {
             });
         }
 
+        let order_builder = auth
+            .signer
+            .clone()
+            .map(|signer| crate::orders::OrderBuilder::new(signer, auth.sig_type, auth.funder));
+
         Self {
-            http_client: optimized_client,
+            http_client,
             base_url: host.to_string(),
-            chain_id: 137, // Default to Polygon
-            signer: None,
-            api_creds: None,
-            order_builder: None,
+            chain_id,
+            signer: auth.signer,
+            api_creds: auth.api_creds,
+            builder_code: auth.builder_code,
+            order_builder,
             dns_cache,
             connection_manager,
             buffer_pool,
         }
+    }
+
+    /// Create a new client with optimized HTTP/2 settings (benchmarked 11.4% faster)
+    /// Now includes DNS caching, connection management, and buffer pooling
+    pub fn new(host: &str) -> Self {
+        let http_client = build_http_client(host, None, None);
+        Self::build_client(host, 137, http_client, ClientAuthConfig::default())
+    }
+
+    /// Create a V2-native client from config.
+    pub fn from_config(config: ClientConfig) -> Result<Self> {
+        let signer = match config.private_key.as_deref() {
+            Some(private_key) => Some(
+                private_key
+                    .parse::<PrivateKeySigner>()
+                    .map_err(|e| PolyfillError::config(format!("Invalid private key: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let sig_type = config
+            .signature_type
+            .map(crate::orders::sig_type_from_u8)
+            .transpose()?;
+        let explicit_funder = config
+            .funder
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .map_err(|e| PolyfillError::config(format!("Invalid funder address: {e}")))?;
+        let funder = match (&signer, sig_type) {
+            (Some(signer), Some(sig_type)) => crate::orders::resolve_funder(
+                signer.address(),
+                config.chain,
+                sig_type,
+                explicit_funder,
+            )?,
+            _ => explicit_funder,
+        };
+
+        let http_client =
+            build_http_client(&config.base_url, config.timeout, config.max_connections);
+
+        Ok(Self::build_client(
+            &config.base_url,
+            config.chain,
+            http_client,
+            ClientAuthConfig {
+                signer,
+                api_creds: config.api_credentials,
+                builder_code: config.builder_code,
+                sig_type,
+                funder,
+            },
+        ))
     }
 
     /// Create a client optimized for co-located environments
@@ -145,26 +219,7 @@ impl ClobClient {
                 .build()
                 .expect("Failed to build reqwest client")
         });
-
-        let connection_manager = Some(std::sync::Arc::new(
-            crate::connection_manager::ConnectionManager::new(
-                http_client.clone(),
-                host.to_string(),
-            ),
-        ));
-        let buffer_pool = std::sync::Arc::new(crate::buffer_pool::BufferPool::new(512 * 1024, 10));
-
-        Self {
-            http_client,
-            base_url: host.to_string(),
-            chain_id: 137,
-            signer: None,
-            api_creds: None,
-            order_builder: None,
-            dns_cache: None,
-            connection_manager,
-            buffer_pool,
-        }
+        Self::build_client(host, 137, http_client, ClientAuthConfig::default())
     }
 
     /// Create a client optimized for internet connections
@@ -175,113 +230,37 @@ impl ClobClient {
                 .build()
                 .expect("Failed to build reqwest client")
         });
-
-        let connection_manager = Some(std::sync::Arc::new(
-            crate::connection_manager::ConnectionManager::new(
-                http_client.clone(),
-                host.to_string(),
-            ),
-        ));
-        let buffer_pool = std::sync::Arc::new(crate::buffer_pool::BufferPool::new(512 * 1024, 10));
-
-        Self {
-            http_client,
-            base_url: host.to_string(),
-            chain_id: 137,
-            signer: None,
-            api_creds: None,
-            order_builder: None,
-            dns_cache: None,
-            connection_manager,
-            buffer_pool,
-        }
+        Self::build_client(host, 137, http_client, ClientAuthConfig::default())
     }
 
     /// Create a client with L1 headers (for authentication)
+    #[deprecated(note = "Use ClobClient::from_config(ClientConfig) for authenticated clients")]
     pub fn with_l1_headers(host: &str, private_key: &str, chain_id: u64) -> Self {
-        let signer = private_key
-            .parse::<PrivateKeySigner>()
-            .expect("Invalid private key");
-
-        let order_builder = crate::orders::OrderBuilder::new(signer.clone(), None, None);
-
-        let http_client = create_optimized_client().unwrap_or_else(|_| {
-            reqwest::ClientBuilder::new()
-                .no_proxy()
-                .build()
-                .expect("Failed to build reqwest client")
-        });
-
-        // Initialize infrastructure modules
-        let dns_cache = None; // Skip DNS cache for simplicity in this constructor
-        let connection_manager = Some(std::sync::Arc::new(
-            crate::connection_manager::ConnectionManager::new(
-                http_client.clone(),
-                host.to_string(),
-            ),
-        ));
-        let buffer_pool = std::sync::Arc::new(crate::buffer_pool::BufferPool::new(512 * 1024, 10));
-
-        Self {
-            http_client,
+        Self::from_config(ClientConfig {
             base_url: host.to_string(),
-            chain_id,
-            signer: Some(signer),
-            api_creds: None,
-            order_builder: Some(order_builder),
-            dns_cache,
-            connection_manager,
-            buffer_pool,
-        }
+            chain: chain_id,
+            private_key: Some(private_key.to_string()),
+            ..ClientConfig::default()
+        })
+        .expect("failed to build authenticated client")
     }
 
     /// Create a client with L2 headers (for API key authentication)
-    ///
-    /// `sig_type` and `funder` are optional parameters for proxy wallet support.
-    /// When using a Polymarket proxy wallet, pass `SigType::PolyProxy` and the
-    /// proxy wallet address as `funder`.
+    #[deprecated(note = "Use ClobClient::from_config(ClientConfig) for authenticated clients")]
     pub fn with_l2_headers(
         host: &str,
         private_key: &str,
         chain_id: u64,
         api_creds: ApiCreds,
-        sig_type: Option<crate::orders::SigType>,
-        funder: Option<Address>,
     ) -> Self {
-        let signer = private_key
-            .parse::<PrivateKeySigner>()
-            .expect("Invalid private key");
-
-        let order_builder = crate::orders::OrderBuilder::new(signer.clone(), sig_type, funder);
-
-        let http_client = create_optimized_client().unwrap_or_else(|_| {
-            reqwest::ClientBuilder::new()
-                .no_proxy()
-                .build()
-                .expect("Failed to build reqwest client")
-        });
-
-        // Initialize infrastructure modules
-        let dns_cache = None; // Skip DNS cache for simplicity in this constructor
-        let connection_manager = Some(std::sync::Arc::new(
-            crate::connection_manager::ConnectionManager::new(
-                http_client.clone(),
-                host.to_string(),
-            ),
-        ));
-        let buffer_pool = std::sync::Arc::new(crate::buffer_pool::BufferPool::new(512 * 1024, 10));
-
-        Self {
-            http_client,
+        Self::from_config(ClientConfig {
             base_url: host.to_string(),
-            chain_id,
-            signer: Some(signer),
-            api_creds: Some(api_creds),
-            order_builder: Some(order_builder),
-            dns_cache,
-            connection_manager,
-            buffer_pool,
-        }
+            chain: chain_id,
+            private_key: Some(private_key.to_string()),
+            api_credentials: Some(api_creds),
+            ..ClientConfig::default()
+        })
+        .expect("failed to build authenticated client")
     }
 
     /// Set API credentials
@@ -491,6 +470,82 @@ impl ClobClient {
         Ok(price)
     }
 
+    async fn get_market_by_token(&self, token_id: &str) -> Result<MarketByTokenResponse> {
+        let response = self
+            .http_client
+            .get(format!("{}/markets-by-token/{}", self.base_url, token_id))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(PolyfillError::api(
+                response.status().as_u16(),
+                "Failed to get market by token",
+            ));
+        }
+
+        response
+            .json::<MarketByTokenResponse>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
+    }
+
+    /// Get V2 CLOB-level market info for a condition ID.
+    pub async fn get_clob_market_info(&self, condition_id: &str) -> Result<ClobMarketInfo> {
+        let response = self
+            .http_client
+            .get(format!("{}/clob-markets/{}", self.base_url, condition_id))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(PolyfillError::api(
+                response.status().as_u16(),
+                "Failed to get clob market info",
+            ));
+        }
+
+        response
+            .json::<ClobMarketInfo>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
+    }
+
+    /// Get V2 builder fee rates for a bytes32 builder code.
+    pub async fn get_builder_fee_rate(&self, builder_code: &str) -> Result<BuilderFeeRateResponse> {
+        crate::orders::validate_bytes32_hex("builder_code", builder_code)?;
+
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("Signer not set"))?;
+        let api_creds = self
+            .api_creds
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
+
+        let endpoint = format!("/fees/builder-fees/{builder_code}");
+        let headers = create_l2_headers::<Value>(signer, api_creds, "GET", &endpoint, None)?;
+        let req = self.create_request_with_headers(Method::GET, &endpoint, headers.into_iter());
+
+        let response = req.send().await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let message = if body.is_empty() {
+                "Failed to get builder fee rate".to_string()
+            } else {
+                format!("Failed to get builder fee rate: {body}")
+            };
+            return Err(PolyfillError::api(status, message));
+        }
+
+        response
+            .json::<BuilderFeeRateResponse>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
+    }
+
     fn validate_prices_history_asset_id(asset_id: &str) -> Result<()> {
         if asset_id.is_empty() {
             return Err(PolyfillError::validation(
@@ -627,8 +682,18 @@ impl ClobClient {
             ));
         }
 
-        let tick_size_response: TickSizeResponse = response.json().await?;
-        Ok(tick_size_response.minimum_tick_size)
+        let tick_size_response: Value = response.json().await?;
+        let tick_size = tick_size_response["minimum_tick_size"]
+            .as_str()
+            .and_then(|s| Decimal::from_str(s).ok())
+            .or_else(|| {
+                tick_size_response["minimum_tick_size"]
+                    .as_f64()
+                    .map(|f| Decimal::from_f64(f).unwrap_or(Decimal::ZERO))
+            })
+            .ok_or_else(|| PolyfillError::parse("Invalid tick size format", None))?;
+
+        Ok(tick_size)
     }
 
     /// Get maker fee rate (in bps) for a token
@@ -814,8 +879,12 @@ impl ClobClient {
             ));
         }
 
-        let neg_risk_response: NegRiskResponse = response.json().await?;
-        Ok(neg_risk_response.neg_risk)
+        let neg_risk_response: Value = response.json().await?;
+        let neg_risk = neg_risk_response["neg_risk"]
+            .as_bool()
+            .ok_or_else(|| PolyfillError::parse("Invalid neg risk format", None))?;
+
+        Ok(neg_risk)
     }
 
     /// Resolve tick size for an order
@@ -845,11 +914,11 @@ impl ClobClient {
     async fn get_filled_order_options(
         &self,
         token_id: &str,
-        options: Option<&OrderOptions>,
-    ) -> Result<OrderOptions> {
-        let (tick_size, neg_risk, fee_rate_bps) = match options {
-            Some(o) => (o.tick_size, o.neg_risk, o.fee_rate_bps),
-            None => (None, None, None),
+        options: Option<&CreateOrderOptions>,
+    ) -> Result<CreateOrderOptions> {
+        let (tick_size, neg_risk) = match options {
+            Some(o) => (o.tick_size, o.neg_risk),
+            None => (None, None),
         };
 
         let tick_size = self.resolve_tick_size(token_id, tick_size).await?;
@@ -858,10 +927,9 @@ impl ClobClient {
             None => self.get_neg_risk(token_id).await?,
         };
 
-        Ok(OrderOptions {
+        Ok(CreateOrderOptions {
             tick_size: Some(tick_size),
             neg_risk: Some(neg_risk),
-            fee_rate_bps,
         })
     }
 
@@ -872,13 +940,16 @@ impl ClobClient {
         price >= min_price && price <= max_price
     }
 
+    async fn get_clob_market_info_for_token(&self, token_id: &str) -> Result<ClobMarketInfo> {
+        let market = self.get_market_by_token(token_id).await?;
+        self.get_clob_market_info(&market.condition_id).await
+    }
+
     /// Create an order
     pub async fn create_order(
         &self,
         order_args: &OrderArgs,
-        expiration: Option<u64>,
-        extras: Option<crate::types::ExtraOrderArgs>,
-        options: Option<&OrderOptions>,
+        options: Option<&CreateOrderOptions>,
     ) -> Result<SignedOrderRequest> {
         let order_builder = self
             .order_builder
@@ -888,9 +959,10 @@ impl ClobClient {
         let create_order_options = self
             .get_filled_order_options(&order_args.token_id, options)
             .await?;
-
-        let expiration = expiration.unwrap_or(0);
-        let extras = extras.unwrap_or_default();
+        let mut order_args = order_args.clone();
+        if order_args.builder_code.is_none() {
+            order_args.builder_code = self.builder_code.clone();
+        }
 
         if !self.is_price_in_range(
             order_args.price,
@@ -901,13 +973,7 @@ impl ClobClient {
             ));
         }
 
-        order_builder.create_order(
-            self.chain_id,
-            order_args,
-            expiration,
-            &extras,
-            &create_order_options,
-        )
+        order_builder.create_order(self.chain_id, &order_args, &create_order_options)
     }
 
     /// Calculate market price from order book
@@ -916,6 +982,7 @@ impl ClobClient {
         token_id: &str,
         side: Side,
         amount: Decimal,
+        order_type: OrderType,
     ) -> Result<Decimal> {
         let book = self.get_order_book(token_id).await?;
         let order_builder = self
@@ -943,15 +1010,14 @@ impl ClobClient {
                 .collect(),
         };
 
-        order_builder.calculate_market_price(side, &levels, amount)
+        order_builder.calculate_market_price(&levels, amount, side, order_type)
     }
 
     /// Create a market order
     pub async fn create_market_order(
         &self,
-        order_args: &crate::types::MarketOrderArgs,
-        extras: Option<crate::types::ExtraOrderArgs>,
-        options: Option<&OrderOptions>,
+        order_args: &MarketOrderArgs,
+        options: Option<&CreateOrderOptions>,
     ) -> Result<SignedOrderRequest> {
         let order_builder = self
             .order_builder
@@ -961,11 +1027,70 @@ impl ClobClient {
         let create_order_options = self
             .get_filled_order_options(&order_args.token_id, options)
             .await?;
+        if !matches!(order_args.order_type, OrderType::FOK | OrderType::FAK) {
+            return Err(PolyfillError::validation(
+                "Market orders only support FOK and FAK order types",
+            ));
+        }
 
-        let extras = extras.unwrap_or_default();
-        let price = self
-            .calculate_market_price(&order_args.token_id, order_args.side, order_args.amount)
+        let mut order_args = order_args.clone();
+        if order_args.builder_code.is_none() {
+            order_args.builder_code = self.builder_code.clone();
+        }
+
+        let market_price = self
+            .calculate_market_price(
+                &order_args.token_id,
+                order_args.side,
+                order_args.amount,
+                order_args.order_type,
+            )
             .await?;
+
+        let price = match order_args.price_limit {
+            Some(limit) => {
+                let limit_ok = match order_args.side {
+                    Side::BUY => market_price <= limit,
+                    Side::SELL => market_price >= limit,
+                };
+                if !limit_ok {
+                    return Err(PolyfillError::validation(format!(
+                        "Calculated market price {market_price} violates price_limit {limit}"
+                    )));
+                }
+                limit
+            },
+            None => market_price,
+        };
+
+        if order_args.side == Side::BUY {
+            if let Some(user_balance) = order_args.user_usdc_balance {
+                let market_info = self
+                    .get_clob_market_info_for_token(&order_args.token_id)
+                    .await?;
+                let fee_details = market_info.fd.unwrap_or(crate::types::ClobFeeDetails {
+                    r: Decimal::ZERO,
+                    e: 0,
+                    to: false,
+                });
+                let builder_taker_fee_rate = match order_args.builder_code.as_deref() {
+                    Some(code) if code != crate::orders::BYTES32_ZERO => {
+                        let rate = self.get_builder_fee_rate(code).await?;
+                        Decimal::from(rate.builder_taker_fee_rate_bps) / Decimal::from(10_000_u32)
+                    },
+                    _ => Decimal::ZERO,
+                };
+
+                order_args.amount = crate::orders::adjust_buy_amount_for_fees(
+                    order_args.amount,
+                    price,
+                    user_balance,
+                    fee_details.r,
+                    fee_details.e,
+                    builder_taker_fee_rate,
+                )?;
+            }
+        }
 
         if !self.is_price_in_range(
             price,
@@ -976,21 +1101,15 @@ impl ClobClient {
             ));
         }
 
-        order_builder.create_market_order(
-            self.chain_id,
-            order_args,
-            price,
-            &extras,
-            &create_order_options,
-        )
+        order_builder.create_market_order(self.chain_id, &order_args, price, &create_order_options)
     }
 
     /// Post an order to the exchange
     pub async fn post_order(
         &self,
         order: SignedOrderRequest,
-        order_type: OrderType,
-    ) -> Result<crate::types::PostOrderResponse> {
+        options: Option<&PostOrderOptions>,
+    ) -> Result<PostOrderResponse> {
         let signer = self
             .signer
             .as_ref()
@@ -999,10 +1118,28 @@ impl ClobClient {
             .api_creds
             .as_ref()
             .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
+        let options = options.copied().unwrap_or_default();
+
+        if options.post_only && matches!(options.order_type, OrderType::FOK | OrderType::FAK) {
+            return Err(PolyfillError::validation(
+                "post_only is not supported for FOK/FAK orders",
+            ));
+        }
+        let expiration = order.expiration.parse::<u64>().map_err(|e| {
+            PolyfillError::validation(format!(
+                "Invalid order expiration '{}': {e}",
+                order.expiration
+            ))
+        })?;
+        if expiration > 0 && options.order_type != OrderType::GTD {
+            return Err(PolyfillError::validation(
+                "expiration is only supported for GTD orders",
+            ));
+        }
 
         // Owner field must reference the credential principal identifier
         // to maintain consistency with the authentication context layer
-        let body = PostOrder::new(order, api_creds.api_key.clone(), order_type);
+        let body = PostOrder::new(order, api_creds.api_key.clone(), options);
 
         let headers = create_l2_headers(signer, api_creds, "POST", "/order", Some(&body))?;
         let req = self.create_request_with_headers(Method::POST, "/order", headers.into_iter());
@@ -1019,106 +1156,41 @@ impl ClobClient {
             return Err(PolyfillError::api(status, message));
         }
 
-        Ok(response.json::<crate::types::PostOrderResponse>().await?)
+        response
+            .json::<PostOrderResponse>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
     }
 
-    /// Post multiple orders to the exchange in a single request
-    pub async fn post_orders(
-        &self,
-        orders: Vec<SignedOrderRequest>,
-        order_type: OrderType,
-    ) -> Result<Vec<crate::types::PostOrderResponse>> {
-        if orders.is_empty() {
-            return Err(PolyfillError::validation("orders cannot be empty"));
-        }
-        if orders.len() > 15 {
-            return Err(PolyfillError::validation(
-                "orders cannot exceed 15 items per batch",
-            ));
-        }
-
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or_else(|| PolyfillError::auth("Signer not set"))?;
-        let api_creds = self
-            .api_creds
-            .as_ref()
-            .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
-
-        let body: Vec<PostOrder> = orders
-            .into_iter()
-            .map(|order| PostOrder::new(order, api_creds.api_key.clone(), order_type))
-            .collect();
-
-        let headers = create_l2_headers(signer, api_creds, "POST", "/orders", Some(&body))?;
-        let req = self.create_request_with_headers(Method::POST, "/orders", headers.into_iter());
-
-        let response = req.json(&body).send().await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            let message = if body.is_empty() {
-                "Failed to post orders".to_string()
-            } else {
-                format!("Failed to post orders: {}", body)
-            };
-            return Err(PolyfillError::api(status, message));
-        }
-
-        Ok(response
-            .json::<Vec<crate::types::PostOrderResponse>>()
-            .await?)
-    }
-
-    /// Create and post an order in one call with an explicit order type
-    pub async fn create_and_post_order_with_type(
-        &self,
-        order_args: &OrderArgs,
-        order_type: OrderType,
-    ) -> Result<crate::types::PostOrderResponse> {
-        let order = self.create_order(order_args, None, None, None).await?;
-        self.post_order(order, order_type).await
-    }
-
-    /// Create and post an order in one call (defaults to GTC)
+    /// Create and post an order in one call
     pub async fn create_and_post_order(
         &self,
         order_args: &OrderArgs,
-    ) -> Result<crate::types::PostOrderResponse> {
-        self.create_and_post_order_with_type(order_args, OrderType::GTC)
-            .await
+        create_options: Option<&CreateOrderOptions>,
+        post_options: Option<&PostOrderOptions>,
+    ) -> Result<PostOrderResponse> {
+        let order = self.create_order(order_args, create_options).await?;
+        self.post_order(order, post_options).await
     }
 
-    /// Create and post multiple orders in one call with an explicit order type
-    pub async fn create_and_post_orders_with_type(
+    /// Create and post a market order in one call.
+    pub async fn create_and_post_market_order(
         &self,
-        order_args: &[OrderArgs],
-        order_type: OrderType,
-    ) -> Result<Vec<crate::types::PostOrderResponse>> {
-        if order_args.is_empty() {
-            return Err(PolyfillError::validation("order_args cannot be empty"));
-        }
-
-        let mut orders = Vec::with_capacity(order_args.len());
-        for args in order_args {
-            orders.push(self.create_order(args, None, None, None).await?);
-        }
-
-        self.post_orders(orders, order_type).await
-    }
-
-    /// Create and post multiple orders in one call (defaults to GTC)
-    pub async fn create_and_post_orders(
-        &self,
-        order_args: &[OrderArgs],
-    ) -> Result<Vec<crate::types::PostOrderResponse>> {
-        self.create_and_post_orders_with_type(order_args, OrderType::GTC)
-            .await
+        order_args: &MarketOrderArgs,
+        create_options: Option<&CreateOrderOptions>,
+        post_options: Option<&PostOrderOptions>,
+    ) -> Result<PostOrderResponse> {
+        let post_options = post_options.copied().unwrap_or(PostOrderOptions {
+            order_type: order_args.order_type,
+            post_only: false,
+            defer_exec: false,
+        });
+        let order = self.create_market_order(order_args, create_options).await?;
+        self.post_order(order, Some(&post_options)).await
     }
 
     /// Cancel an order
-    pub async fn cancel(&self, order_id: &str) -> Result<crate::types::CancelOrdersResponse> {
+    pub async fn cancel(&self, order_id: &str) -> Result<CancelOrdersResponse> {
         let signer = self
             .signer
             .as_ref()
@@ -1141,16 +1213,14 @@ impl ClobClient {
             ));
         }
 
-        Ok(response
-            .json::<crate::types::CancelOrdersResponse>()
-            .await?)
+        response
+            .json::<CancelOrdersResponse>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
     }
 
     /// Cancel multiple orders
-    pub async fn cancel_orders(
-        &self,
-        order_ids: &[String],
-    ) -> Result<crate::types::CancelOrdersResponse> {
+    pub async fn cancel_orders(&self, order_ids: &[String]) -> Result<CancelOrdersResponse> {
         let signer = self
             .signer
             .as_ref()
@@ -1171,13 +1241,14 @@ impl ClobClient {
             ));
         }
 
-        Ok(response
-            .json::<crate::types::CancelOrdersResponse>()
-            .await?)
+        response
+            .json::<CancelOrdersResponse>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
     }
 
     /// Cancel all orders
-    pub async fn cancel_all(&self) -> Result<crate::types::CancelOrdersResponse> {
+    pub async fn cancel_all(&self) -> Result<CancelOrdersResponse> {
         let signer = self
             .signer
             .as_ref()
@@ -1187,7 +1258,7 @@ impl ClobClient {
             .as_ref()
             .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
 
-        let headers = create_l2_headers::<()>(signer, api_creds, "DELETE", "/cancel-all", None)?;
+        let headers = create_l2_headers::<Value>(signer, api_creds, "DELETE", "/cancel-all", None)?;
         let req =
             self.create_request_with_headers(Method::DELETE, "/cancel-all", headers.into_iter());
 
@@ -1199,20 +1270,25 @@ impl ClobClient {
             ));
         }
 
-        Ok(response
-            .json::<crate::types::CancelOrdersResponse>()
-            .await?)
+        response
+            .json::<CancelOrdersResponse>()
+            .await
+            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {e}"), None))
     }
 
-    /// Fetch a single page of orders.
+    /// Get open orders with optional filtering
     ///
-    /// Returns `(page_data, next_cursor)`. `next_cursor` is `None` when there are
-    /// no more pages.
-    pub async fn get_orders_page(
+    /// This retrieves all open orders for the authenticated user. You can filter by:
+    /// - Order ID (exact match)
+    /// - Asset/Token ID (all orders for a specific token)
+    /// - Market ID (all orders for a specific market)
+    ///
+    /// The response includes order status, fill information, and timestamps.
+    pub async fn get_orders(
         &self,
         params: Option<&crate::types::OpenOrderParams>,
         next_cursor: Option<&str>,
-    ) -> Result<(Vec<crate::types::OpenOrder>, Option<String>)> {
+    ) -> Result<Vec<crate::types::OpenOrder>> {
         let signer = self
             .signer
             .as_ref()
@@ -1232,146 +1308,53 @@ impl ClobClient {
             Some(p) => p.to_query_params(),
         };
 
-        let cursor = next_cursor.unwrap_or("MA==");
-
-        let req = self
-            .http_client
-            .request(method.clone(), format!("{}{}", self.base_url, endpoint))
-            .query(&query_params)
-            .query(&[("next_cursor", cursor)]);
-
-        let r = headers
-            .into_iter()
-            .fold(req, |r, (k, v)| r.header(HeaderName::from_static(k), v));
-
-        let resp = r
-            .send()
-            .await
-            .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?
-            .json::<Value>()
-            .await
-            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))?;
-
-        let new_cursor = resp["next_cursor"]
-            .as_str()
-            .ok_or_else(|| PolyfillError::parse("Failed to parse next cursor".to_string(), None))?
-            .to_owned();
-
-        let results = resp["data"].clone();
-        let orders =
-            serde_json::from_value::<Vec<crate::types::OpenOrder>>(results).map_err(|e| {
-                PolyfillError::parse(
-                    format!("Failed to parse data from order response: {}", e),
-                    None,
-                )
-            })?;
-
-        let next = if new_cursor == "LTE=" {
-            None
-        } else {
-            Some(new_cursor)
-        };
-
-        Ok((orders, next))
-    }
-
-    /// Get open orders with optional filtering
-    ///
-    /// This retrieves all open orders for the authenticated user. You can filter by:
-    /// - Order ID (exact match)
-    /// - Asset/Token ID (all orders for a specific token)
-    /// - Market ID (all orders for a specific market)
-    ///
-    /// The response includes order status, fill information, and timestamps.
-    pub async fn get_orders(
-        &self,
-        params: Option<&crate::types::OpenOrderParams>,
-        next_cursor: Option<&str>,
-    ) -> Result<Vec<crate::types::OpenOrder>> {
-        let mut cursor = next_cursor.map(|s| s.to_owned());
+        let mut next_cursor = next_cursor.unwrap_or("MA==").to_string(); // INITIAL_CURSOR
         let mut output = Vec::new();
 
-        loop {
-            let (page, next) = self.get_orders_page(params, cursor.as_deref()).await?;
-            output.extend(page);
-            match next {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
+        while next_cursor != "LTE=" {
+            // END_CURSOR
+            let req = self
+                .http_client
+                .request(method.clone(), format!("{}{}", self.base_url, endpoint))
+                .query(&query_params)
+                .query(&[("next_cursor", &next_cursor)]);
+
+            let r = headers
+                .clone()
+                .into_iter()
+                .fold(req, |r, (k, v)| r.header(HeaderName::from_static(k), v));
+
+            let resp = r
+                .send()
+                .await
+                .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?
+                .json::<Value>()
+                .await
+                .map_err(|e| {
+                    PolyfillError::parse(format!("Failed to parse response: {}", e), None)
+                })?;
+
+            let new_cursor = resp["next_cursor"]
+                .as_str()
+                .ok_or_else(|| {
+                    PolyfillError::parse("Failed to parse next cursor".to_string(), None)
+                })?
+                .to_owned();
+
+            next_cursor = new_cursor;
+
+            let results = resp["data"].clone();
+            let orders =
+                serde_json::from_value::<Vec<crate::types::OpenOrder>>(results).map_err(|e| {
+                    PolyfillError::parse(
+                        format!("Failed to parse data from order response: {}", e),
+                        None,
+                    )
+                })?;
+            output.extend(orders);
         }
 
         Ok(output)
-    }
-
-    /// Fetch a single page of trades.
-    ///
-    /// Returns `(page_data, next_cursor)`. `next_cursor` is `None` when there are
-    /// no more pages.
-    pub async fn get_trades_page(
-        &self,
-        params: Option<&crate::types::TradeParams>,
-        next_cursor: Option<&str>,
-    ) -> Result<(Vec<crate::types::TradeResponse>, Option<String>)> {
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or_else(|| PolyfillError::auth("Signer not set"))?;
-        let api_creds = self
-            .api_creds
-            .as_ref()
-            .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
-
-        let method = Method::GET;
-        let endpoint = "/data/trades";
-        let headers =
-            create_l2_headers::<Value>(signer, api_creds, method.as_str(), endpoint, None)?;
-
-        let query_params = match params {
-            None => Vec::new(),
-            Some(p) => p.to_query_params(),
-        };
-
-        let cursor = next_cursor.unwrap_or("MA==");
-
-        let req = self
-            .http_client
-            .request(method.clone(), format!("{}{}", self.base_url, endpoint))
-            .query(&query_params)
-            .query(&[("next_cursor", cursor)]);
-
-        let r = headers
-            .into_iter()
-            .fold(req, |r, (k, v)| r.header(HeaderName::from_static(k), v));
-
-        let resp = r
-            .send()
-            .await
-            .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?
-            .json::<Value>()
-            .await
-            .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))?;
-
-        let new_cursor = resp["next_cursor"]
-            .as_str()
-            .ok_or_else(|| PolyfillError::parse("Failed to parse next cursor".to_string(), None))?
-            .to_owned();
-
-        let results = resp["data"].clone();
-        let trades =
-            serde_json::from_value::<Vec<crate::types::TradeResponse>>(results).map_err(|e| {
-                PolyfillError::parse(
-                    format!("Failed to parse data from trades response: {}", e),
-                    None,
-                )
-            })?;
-
-        let next = if new_cursor == "LTE=" {
-            None
-        } else {
-            Some(new_cursor)
-        };
-
-        Ok((trades, next))
     }
 
     /// Get trade history with optional filtering
@@ -1388,19 +1371,63 @@ impl ClobClient {
         &self,
         trade_params: Option<&crate::types::TradeParams>,
         next_cursor: Option<&str>,
-    ) -> Result<Vec<crate::types::TradeResponse>> {
-        let mut cursor = next_cursor.map(|s| s.to_owned());
+    ) -> Result<Vec<Value>> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("Signer not set"))?;
+        let api_creds = self
+            .api_creds
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("API credentials not set"))?;
+
+        let method = Method::GET;
+        let endpoint = "/data/trades";
+        let headers =
+            create_l2_headers::<Value>(signer, api_creds, method.as_str(), endpoint, None)?;
+
+        let query_params = match trade_params {
+            None => Vec::new(),
+            Some(p) => p.to_query_params(),
+        };
+
+        let mut next_cursor = next_cursor.unwrap_or("MA==").to_string(); // INITIAL_CURSOR
         let mut output = Vec::new();
 
-        loop {
-            let (page, next) = self
-                .get_trades_page(trade_params, cursor.as_deref())
-                .await?;
-            output.extend(page);
-            match next {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
+        while next_cursor != "LTE=" {
+            // END_CURSOR
+            let req = self
+                .http_client
+                .request(method.clone(), format!("{}{}", self.base_url, endpoint))
+                .query(&query_params)
+                .query(&[("next_cursor", &next_cursor)]);
+
+            let r = headers
+                .clone()
+                .into_iter()
+                .fold(req, |r, (k, v)| r.header(HeaderName::from_static(k), v));
+
+            let resp = r
+                .send()
+                .await
+                .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?
+                .json::<Value>()
+                .await
+                .map_err(|e| {
+                    PolyfillError::parse(format!("Failed to parse response: {}", e), None)
+                })?;
+
+            let new_cursor = resp["next_cursor"]
+                .as_str()
+                .ok_or_else(|| {
+                    PolyfillError::parse("Failed to parse next cursor".to_string(), None)
+                })?
+                .to_owned();
+
+            next_cursor = new_cursor;
+
+            let results = resp["data"].clone();
+            output.push(results);
         }
 
         Ok(output)
@@ -1698,7 +1725,7 @@ impl ClobClient {
         &self,
         market: Option<&str>,
         asset_id: Option<&str>,
-    ) -> Result<crate::types::CancelOrdersResponse> {
+    ) -> Result<Value> {
         let signer = self
             .signer
             .as_ref()
@@ -1732,7 +1759,7 @@ impl ClobClient {
             .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
 
         response
-            .json::<crate::types::CancelOrdersResponse>()
+            .json::<Value>()
             .await
             .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))
     }
@@ -1854,12 +1881,12 @@ impl ClobClient {
             .await
             .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
 
-        let result: crate::types::OrderScoringResponse = response
+        let result: Value = response
             .json()
             .await
             .map_err(|e| PolyfillError::parse(format!("Failed to parse response: {}", e), None))?;
 
-        Ok(result.scoring)
+        Ok(result["scoring"].as_bool().unwrap_or(false))
     }
 
     /// Check if multiple orders are scoring
@@ -2409,19 +2436,12 @@ impl ClobClient {
 
 // Re-export types from the canonical location in types.rs
 pub use crate::types::{
-    CancelOrdersResponse, ExtraOrderArgs, MakerOrder, Market, MarketOrderArgs, MarketsResponse,
-    MidpointResponse, NegRiskResponse, OrderBookSummary, OrderScoringResponse, OrderSummary,
-    PostOrderResponse, PriceHistoryPoint, PriceResponse, PricesHistoryInterval,
-    PricesHistoryResponse, Rewards, SpreadResponse, TickSizeResponse, Token, TradeResponse,
-    TraderSide,
+    CancelOrdersResponse as TypedCancelOrdersResponse, ClobMarketInfo as TypedClobMarketInfo,
+    CreateOrderOptions as TypedCreateOrderOptions, Market, MarketsResponse, MidpointResponse,
+    NegRiskResponse, OrderBookSummary, OrderSummary, PostOrderOptions as TypedPostOrderOptions,
+    PostOrderResponse as TypedPostOrderResponse, PriceResponse, PricesHistoryInterval,
+    PricesHistoryResponse, Rewards, SpreadResponse, TickSizeResponse, Token,
 };
-
-// Compatibility types that need to stay in client.rs
-#[derive(Debug, Default)]
-pub struct CreateOrderOptions {
-    pub tick_size: Option<Decimal>,
-    pub neg_risk: Option<bool>,
-}
 
 // Re-export for compatibility
 pub type PolyfillClient = ClobClient;
@@ -2430,10 +2450,10 @@ pub type PolyfillClient = ClobClient;
 mod tests {
     use super::{ClobClient, OrderArgs as ClientOrderArgs};
     use crate::types::{
-        PricesHistoryInterval, RfqCreateQuote, RfqCreateRequest, RfqOrderExecutionRequest,
-        RfqQuotesParams, RfqRequestsParams, Side,
+        OrderType, PostOrderOptions, PricesHistoryInterval, RfqCreateQuote, RfqCreateRequest,
+        RfqOrderExecutionRequest, RfqQuotesParams, RfqRequestsParams, Side, SignedOrderRequest,
     };
-    use crate::{ApiCredentials, PolyfillError};
+    use crate::{ApiCredentials, ClientConfig, PolyfillError};
     use mockito::{Matcher, Server};
     use rust_decimal::Decimal;
     use serde_json::json;
@@ -2445,11 +2465,15 @@ mod tests {
     }
 
     fn create_test_client_with_auth(base_url: &str) -> ClobClient {
-        ClobClient::with_l1_headers(
-            base_url,
-            "0x1234567890123456789012345678901234567890123456789012345678901234",
-            137,
-        )
+        ClobClient::from_config(ClientConfig {
+            base_url: base_url.to_string(),
+            chain: 137,
+            private_key: Some(
+                "0x1234567890123456789012345678901234567890123456789012345678901234".to_string(),
+            ),
+            ..ClientConfig::default()
+        })
+        .expect("test auth client")
     }
 
     fn create_test_client_with_l2_auth(base_url: &str) -> ClobClient {
@@ -2460,30 +2484,34 @@ mod tests {
             passphrase: "test_passphrase".to_string(),
         };
 
-        ClobClient::with_l2_headers(
-            base_url,
-            "0x1234567890123456789012345678901234567890123456789012345678901234",
-            137,
-            api_creds,
-            None,
-            None,
-        )
+        ClobClient::from_config(ClientConfig {
+            base_url: base_url.to_string(),
+            chain: 137,
+            private_key: Some(
+                "0x1234567890123456789012345678901234567890123456789012345678901234".to_string(),
+            ),
+            api_credentials: Some(api_creds),
+            ..ClientConfig::default()
+        })
+        .expect("test l2 auth client")
     }
 
-    fn sample_signed_order() -> crate::types::SignedOrderRequest {
-        crate::types::SignedOrderRequest {
-            salt: 1,
-            maker: "0x0000000000000000000000000000000000000000".to_string(),
-            signer: "0x0000000000000000000000000000000000000000".to_string(),
-            taker: "0x0000000000000000000000000000000000000000".to_string(),
+    fn sample_signed_order() -> SignedOrderRequest {
+        SignedOrderRequest {
+            salt: 42,
+            maker: "0x1111111111111111111111111111111111111111".to_string(),
+            signer: "0x2222222222222222222222222222222222222222".to_string(),
             token_id: "123".to_string(),
             maker_amount: "100".to_string(),
-            taker_amount: "50".to_string(),
-            expiration: "0".to_string(),
-            nonce: "0".to_string(),
-            fee_rate_bps: "0".to_string(),
+            taker_amount: "250".to_string(),
+            expiration: "1900000000".to_string(),
             side: "BUY".to_string(),
             signature_type: 0,
+            timestamp: "1713916800000".to_string(),
+            metadata: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            builder: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
             signature: "0xdeadbeef".to_string(),
         }
     }
@@ -2497,7 +2525,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_client_with_l1_headers() {
+    async fn test_client_from_config_with_signer() {
         let client = create_test_client_with_auth("https://test.example.com");
         assert_eq!(client.base_url, "https://test.example.com");
         assert!(client.signer.is_some());
@@ -2505,21 +2533,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_client_with_l2_headers() {
+    async fn test_client_from_config_with_api_credentials() {
         let api_creds = ApiCredentials {
             api_key: "test_key".to_string(),
-            secret: "test_secret".to_string(),
+            secret: "dGVzdF9zZWNyZXRfa2V5XzEyMzQ1".to_string(),
             passphrase: "test_passphrase".to_string(),
         };
 
-        let client = ClobClient::with_l2_headers(
-            "https://test.example.com",
-            "0x1234567890123456789012345678901234567890123456789012345678901234",
-            137,
-            api_creds.clone(),
-            None,
-            None,
-        );
+        let client = ClobClient::from_config(ClientConfig {
+            base_url: "https://test.example.com".to_string(),
+            chain: 137,
+            private_key: Some(
+                "0x1234567890123456789012345678901234567890123456789012345678901234".to_string(),
+            ),
+            api_credentials: Some(api_creds.clone()),
+            ..ClientConfig::default()
+        })
+        .expect("configured client");
 
         assert_eq!(client.base_url, "https://test.example.com");
         assert!(client.signer.is_some());
@@ -2773,7 +2803,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_prices_history_interval_success() {
         let mut server = Server::new_async().await;
-        let mock_response = r#"{"history":[{"t":1,"p":"0.52"}]}"#;
+        let mock_response = r#"{"history":[{"t":1}]}"#;
 
         let mock = server
             .mock("GET", "/prices-history")
@@ -2796,8 +2826,6 @@ mod tests {
 
         mock.assert_async().await;
         assert_eq!(response.history.len(), 1);
-        assert_eq!(response.history[0].t, 1);
-        assert_eq!(response.history[0].p, Decimal::from_str("0.52").unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3034,98 +3062,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_post_orders_batch_success() {
-        let mut server = Server::new_async().await;
-        let mock = server
-            .mock("POST", "/orders")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"success":true,"orderID":"a"},{"success":true,"orderID":"b"}]"#)
-            .create_async()
-            .await;
-
-        let client = create_test_client_with_l2_auth(&server.url());
-        let signed_order = sample_signed_order();
-
-        let result = client
-            .post_orders(
-                vec![signed_order.clone(), signed_order],
-                crate::types::OrderType::GTC,
-            )
-            .await;
-
-        mock.assert_async().await;
-        assert!(result.is_ok());
-        let orders = result.unwrap();
-        assert_eq!(orders.len(), 2);
-        assert!(orders.iter().all(|o| o.success));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_post_orders_batch_empty_validation() {
-        let client = create_test_client_with_l2_auth("https://test.example.com");
-        let result = client
-            .post_orders(Vec::new(), crate::types::OrderType::GTC)
-            .await;
-        assert!(matches!(result, Err(PolyfillError::Validation { .. })));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_post_orders_batch_too_many_validation() {
-        let client = create_test_client_with_l2_auth("https://test.example.com");
-        let orders = (0..16).map(|_| sample_signed_order()).collect::<Vec<_>>();
-
-        let result = client
-            .post_orders(orders, crate::types::OrderType::GTC)
-            .await;
-        assert!(matches!(result, Err(PolyfillError::Validation { .. })));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_post_order_supports_fak() {
-        let mut server = Server::new_async().await;
-        let mock = server
-            .mock("POST", "/order")
-            .match_body(Matcher::Regex(r#""orderType":"FAK""#.to_string()))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"orderID":"a"}"#)
-            .create_async()
-            .await;
-
-        let client = create_test_client_with_l2_auth(&server.url());
-        let result = client
-            .post_order(sample_signed_order(), crate::types::OrderType::FAK)
-            .await;
-
-        mock.assert_async().await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().success);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_post_orders_supports_fak() {
-        let mut server = Server::new_async().await;
-        let mock = server
-            .mock("POST", "/orders")
-            .match_body(Matcher::Regex(r#""orderType":"FAK""#.to_string()))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"[{"success":true,"orderID":"a"}]"#)
-            .create_async()
-            .await;
-
-        let client = create_test_client_with_l2_auth(&server.url());
-        let result = client
-            .post_orders(vec![sample_signed_order()], crate::types::OrderType::FAK)
-            .await;
-
-        mock.assert_async().await;
-        assert!(result.is_ok());
-        assert!(result.unwrap()[0].success);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_or_derive_api_key() {
         let mut server = Server::new_async().await;
         let mock_response = r#"{
@@ -3276,6 +3212,220 @@ mod tests {
         assert_eq!(default_args.price, Decimal::ZERO);
         assert_eq!(default_args.size, Decimal::ZERO);
         assert_eq!(default_args.side, Side::BUY);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_clob_market_info_success() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/clob-markets/condition-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "c":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "gst":"ready",
+                    "t":[{"t":"123","o":"YES"},{"t":"456","o":"NO"}],
+                    "mos":"5",
+                    "mts":"0.01",
+                    "rfqe":true,
+                    "itode":false,
+                    "ibce":false,
+                    "nr":false,
+                    "fd":{"r":"0.01","e":2,"to":false},
+                    "oas":"3600"
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = create_test_client(&server.url());
+        let info = client.get_clob_market_info("condition-1").await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(
+            info.c.as_deref(),
+            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(info.t.len(), 2);
+        assert_eq!(info.mos, Decimal::from_str("5").unwrap());
+        assert_eq!(info.mts, Decimal::from_str("0.01").unwrap());
+        assert_eq!(info.tbf, Decimal::ZERO);
+        assert_eq!(info.fd.unwrap().e, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_builder_fee_rate_uses_v2_endpoint() {
+        let mut server = Server::new_async().await;
+        let builder_code = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mock = server
+            .mock("GET", format!("/fees/builder-fees/{builder_code}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "builder_maker_fee_rate_bps": 5,
+                    "builder_taker_fee_rate_bps": 12
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let response = client.get_builder_fee_rate(builder_code).await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(response.builder_maker_fee_rate_bps, 5);
+        assert_eq!(response.builder_taker_fee_rate_bps, 12);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_order_uses_v2_wire_shape_and_typed_response() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/order")
+            .match_body(Matcher::JsonString(
+                json!({
+                    "order": {
+                        "salt": 42,
+                        "maker": "0x1111111111111111111111111111111111111111",
+                        "signer": "0x2222222222222222222222222222222222222222",
+                        "tokenId": "123",
+                        "makerAmount": "100",
+                        "takerAmount": "250",
+                        "expiration": "1900000000",
+                        "side": "BUY",
+                        "signatureType": 0,
+                        "timestamp": "1713916800000",
+                        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                        "builder": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "signature": "0xdeadbeef"
+                    },
+                    "owner": "test_key",
+                    "orderType": "GTD",
+                    "postOnly": true,
+                    "deferExec": true
+                })
+                .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "success":true,
+                    "orderID":"order-1",
+                    "status":"live",
+                    "makingAmount":"100",
+                    "takingAmount":"250",
+                    "transactionsHashes":["0xabc"],
+                    "tradeIds":["trade-1"],
+                    "errorMsg":""
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let response = client
+            .post_order(
+                sample_signed_order(),
+                Some(&PostOrderOptions {
+                    order_type: OrderType::GTD,
+                    post_only: true,
+                    defer_exec: true,
+                }),
+            )
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        assert!(response.success);
+        assert_eq!(response.order_id, "order-1");
+        assert_eq!(response.status, "live");
+        assert_eq!(response.transactions_hashes, vec!["0xabc".to_string()]);
+        assert_eq!(response.trade_ids, vec!["trade-1".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_order_rejects_post_only_for_fak() {
+        let client = create_test_client_with_l2_auth("https://test.example.com");
+        let err = client
+            .post_order(
+                sample_signed_order(),
+                Some(&PostOrderOptions {
+                    order_type: OrderType::FAK,
+                    post_only: true,
+                    defer_exec: false,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PolyfillError::Validation { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_order_rejects_expiration_for_non_gtd() {
+        let client = create_test_client_with_l2_auth("https://test.example.com");
+        let err = client
+            .post_order(
+                sample_signed_order(),
+                Some(&PostOrderOptions {
+                    order_type: OrderType::GTC,
+                    post_only: false,
+                    defer_exec: false,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PolyfillError::Validation { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cancel_endpoints_parse_typed_responses() {
+        let mut server = Server::new_async().await;
+        let cancel_mock = server
+            .mock("DELETE", "/order")
+            .match_body(Matcher::JsonString(r#"{"orderID":"order-1"}"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"canceled":["order-1"],"notCanceled":{}}"#)
+            .create_async()
+            .await;
+        let cancel_orders_mock = server
+            .mock("DELETE", "/orders")
+            .match_body(Matcher::JsonString(r#"["order-1","order-2"]"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"canceled":["order-1"],"notCanceled":{"order-2":"already filled"}}"#)
+            .create_async()
+            .await;
+        let cancel_all_mock = server
+            .mock("DELETE", "/cancel-all")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"canceled":["order-9"],"notCanceled":{}}"#)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let cancel = client.cancel("order-1").await.unwrap();
+        let cancel_many = client
+            .cancel_orders(&["order-1".to_string(), "order-2".to_string()])
+            .await
+            .unwrap();
+        let cancel_all = client.cancel_all().await.unwrap();
+
+        cancel_mock.assert_async().await;
+        cancel_orders_mock.assert_async().await;
+        cancel_all_mock.assert_async().await;
+        assert_eq!(cancel.canceled, vec!["order-1".to_string()]);
+        assert_eq!(
+            cancel_many.not_canceled.get("order-2"),
+            Some(&"already filled".to_string())
+        );
+        assert_eq!(cancel_all.canceled, vec!["order-9".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

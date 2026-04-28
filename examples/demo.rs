@@ -94,21 +94,21 @@ impl PolyfillDemo {
     /// Create a new demo
     pub fn new() -> Result<Self> {
         // Create basic client
-        let client = ClobClient::new("https://clob.polymarket.com");
-
-        // Create advanced client with configuration
-        let _config = ClientConfig {
+        let config = ClientConfig {
             base_url: "https://clob.polymarket.com".to_string(),
-            chain_id: 137,                  // Polygon
-            private_key: None,              // Would be set in production
-            api_credentials: None,          // Would be set in production
-            max_slippage: Some(dec!(0.01)), // 1% max slippage
-            fee_rate: Some(dec!(0.02)),     // 2% fee rate
+            chain: 137,
+            private_key: None,
+            api_credentials: None,
+            builder_code: None,
+            signature_type: None,
+            funder: None,
             timeout: Some(Duration::from_secs(30)),
             max_connections: Some(100),
         };
+        let client = ClobClient::new(&config.base_url);
 
-        let advanced_client = PolyfillClient::new("https://clob.polymarket.com");
+        // Create advanced client with configuration
+        let advanced_client = PolyfillClient::from_config(config.clone())?;
 
         // Create order book manager
         let book_manager = OrderBookManager::new(100);
@@ -623,19 +623,11 @@ impl PolyfillDemo {
                 side: Side::BUY,
                 size: dec!(50.0),
                 price: dec!(0.75),
-                status: TradeMessageStatus::Matched,
+                status: Some("MATCHED".to_string()),
                 msg_type: None,
                 last_update: None,
                 matchtime: None,
                 timestamp: None,
-                outcome: None,
-                owner: None,
-                trade_owner: None,
-                taker_order_id: None,
-                maker_orders: vec![],
-                fee_rate_bps: None,
-                transaction_hash: None,
-                trader_side: None,
             }),
         ];
 
