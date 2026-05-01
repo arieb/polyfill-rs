@@ -257,6 +257,31 @@ impl WebSocketStream {
         self.subscribe_async(subscription).await
     }
 
+    /// Send an application-level `PING` text frame to keep the Polymarket
+    /// CLOB WS connection alive.
+    ///
+    /// The Polymarket `/ws/market` and `/ws/user` channels require the client
+    /// to send `PING` text every ~10 seconds; the server replies with `PONG`.
+    /// Without these app-level pings, the server closes the connection.
+    /// Protocol-level WebSocket pings are not used on these endpoints.
+    pub async fn send_ping(&mut self) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            PolyfillError::stream(
+                "Cannot send PING: WebSocket not connected".to_string(),
+                crate::errors::StreamErrorKind::ConnectionFailed,
+            )
+        })?;
+        let msg = tokio_tungstenite::tungstenite::Message::Text("PING".to_string());
+        connection.send(msg).await.map_err(|e| {
+            PolyfillError::stream(
+                format!("Failed to send PING: {}", e),
+                crate::errors::StreamErrorKind::MessageCorrupted,
+            )
+        })?;
+        self.stats.messages_sent += 1;
+        Ok(())
+    }
+
     /// Unsubscribe from user channel
     pub async fn unsubscribe_user_channel(&mut self, markets: Vec<String>) -> Result<()> {
         let auth = self
@@ -506,6 +531,17 @@ impl Stream for WebSocketStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(ws_message))) => match ws_message {
                     tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        // App-level keepalive replies (Polymarket CLOB WS):
+                        // server sends literal "PONG" text in response to our
+                        // "PING". Treat as a liveness signal and skip parsing.
+                        let trimmed = text.trim();
+                        if trimmed.eq_ignore_ascii_case("PONG")
+                            || trimmed.eq_ignore_ascii_case("PING")
+                        {
+                            self.stats.messages_received += 1;
+                            self.stats.last_message_time = Some(Utc::now());
+                            continue;
+                        }
                         match crate::decode::parse_stream_messages(&text) {
                             Ok(messages) => {
                                 let mut iter = messages.into_iter();
