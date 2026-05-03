@@ -1094,6 +1094,55 @@ impl TradeMessageStatus {
     }
 }
 
+/// Whether the authenticated user was the maker or taker on a trade.
+/// Wire values are uppercase (`"TAKER"` / `"MAKER"`); unknown strings are preserved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TraderSide {
+    Taker,
+    Maker,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl Default for TraderSide {
+    fn default() -> Self {
+        Self::Unknown("UNKNOWN".to_string())
+    }
+}
+
+/// One leg of a multi-maker trade. Present in `TradeMessage.maker_orders`
+/// when the authenticated user (or one of their orders) participated as a maker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MakerOrder {
+    pub order_id: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub maker_address: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::optional_decimal_from_string"
+    )]
+    pub matched_amount: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::optional_decimal_from_string"
+    )]
+    pub price: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::optional_decimal_from_string"
+    )]
+    pub fee_rate_bps: Option<Decimal>,
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub side: Option<Side>,
+}
+
 /// User trade execution message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeMessage {
@@ -1123,6 +1172,36 @@ pub struct TradeMessage {
         deserialize_with = "crate::decode::deserializers::optional_number_from_string"
     )]
     pub timestamp: Option<u64>,
+    /// Outcome (e.g. "Yes" / "No").
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// API key of the event owner.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// API key of the trade owner.
+    #[serde(default)]
+    pub trade_owner: Option<String>,
+    /// Taker order ID.
+    #[serde(default)]
+    pub taker_order_id: Option<String>,
+    /// Maker order details (one entry per maker leg matched in this trade).
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::vec_from_null"
+    )]
+    pub maker_orders: Vec<MakerOrder>,
+    /// Fee rate in basis points (post-fill, reflects the fee actually charged).
+    #[serde(
+        default,
+        deserialize_with = "crate::decode::deserializers::optional_decimal_from_string"
+    )]
+    pub fee_rate_bps: Option<Decimal>,
+    /// Whether the authenticated user was maker or taker on this trade.
+    #[serde(default)]
+    pub trader_side: Option<TraderSide>,
+    /// Maker wallet address (when the user was a maker).
+    #[serde(default)]
+    pub maker_address: Option<String>,
 }
 
 impl TradeMessage {
