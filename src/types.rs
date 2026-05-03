@@ -1065,6 +1065,35 @@ pub struct EventMessage {
     pub description: String,
 }
 
+/// Typed view over `TradeMessage::status` (which is wire-typed `Option<String>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TradeMessageStatus {
+    Matched,
+    Mined,
+    Confirmed,
+    Retrying,
+    Failed,
+    /// Status absent on the wire.
+    Absent,
+    /// Forward-compatible catch-all for unknown statuses.
+    Unknown(String),
+}
+
+impl TradeMessageStatus {
+    /// Parse a wire status string (case-insensitive).
+    pub fn from_wire(s: Option<&str>) -> Self {
+        match s.map(str::trim) {
+            None => Self::Absent,
+            Some(v) if v.eq_ignore_ascii_case("matched") => Self::Matched,
+            Some(v) if v.eq_ignore_ascii_case("mined") => Self::Mined,
+            Some(v) if v.eq_ignore_ascii_case("confirmed") => Self::Confirmed,
+            Some(v) if v.eq_ignore_ascii_case("retrying") => Self::Retrying,
+            Some(v) if v.eq_ignore_ascii_case("failed") => Self::Failed,
+            Some(v) => Self::Unknown(v.to_string()),
+        }
+    }
+}
+
 /// User trade execution message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeMessage {
@@ -1094,6 +1123,13 @@ pub struct TradeMessage {
         deserialize_with = "crate::decode::deserializers::optional_number_from_string"
     )]
     pub timestamp: Option<u64>,
+}
+
+impl TradeMessage {
+    /// Typed view over `status` field. Wire format unchanged.
+    pub fn status_kind(&self) -> TradeMessageStatus {
+        TradeMessageStatus::from_wire(self.status.as_deref())
+    }
 }
 
 /// User order update message.
@@ -1832,3 +1868,39 @@ pub type Result<T> = std::result::Result<T, crate::errors::PolyfillError>;
 
 // Type aliases for 100% compatibility with baseline implementation
 pub type ApiCreds = ApiCredentials;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trade_message_status_from_wire() {
+        assert_eq!(TradeMessageStatus::from_wire(None), TradeMessageStatus::Absent);
+        assert_eq!(TradeMessageStatus::from_wire(Some("matched")), TradeMessageStatus::Matched);
+        assert_eq!(TradeMessageStatus::from_wire(Some("MATCHED")), TradeMessageStatus::Matched);
+        assert_eq!(TradeMessageStatus::from_wire(Some("MINED")), TradeMessageStatus::Mined);
+        assert_eq!(
+            TradeMessageStatus::from_wire(Some("confirmed")),
+            TradeMessageStatus::Confirmed
+        );
+        assert_eq!(
+            TradeMessageStatus::from_wire(Some("RETRYING")),
+            TradeMessageStatus::Retrying
+        );
+        assert_eq!(TradeMessageStatus::from_wire(Some("FAILED")), TradeMessageStatus::Failed);
+        assert_eq!(
+            TradeMessageStatus::from_wire(Some("weird-new-thing")),
+            TradeMessageStatus::Unknown("weird-new-thing".to_string())
+        );
+    }
+
+    #[test]
+    fn trade_message_status_kind_uses_field() {
+        let raw = r#"{
+            "id":"t1","market":"m","asset_id":"a","side":"BUY",
+            "size":"1","price":"0.5","status":"RETRYING"
+        }"#;
+        let tm: TradeMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(tm.status_kind(), TradeMessageStatus::Retrying);
+    }
+}
