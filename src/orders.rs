@@ -707,6 +707,7 @@ mod tests {
                 &CreateOrderOptions {
                     tick_size: Some(Decimal::from_str("0.01").unwrap()),
                     neg_risk: Some(false),
+                    force_tick_size: false,
                 },
             )
             .unwrap();
@@ -744,6 +745,7 @@ mod tests {
                 &CreateOrderOptions {
                     tick_size: Some(Decimal::from_str("0.01").unwrap()),
                     neg_risk: Some(false),
+                    force_tick_size: false,
                 },
             )
             .unwrap();
@@ -849,6 +851,7 @@ mod tests {
                 &CreateOrderOptions {
                     tick_size: Some(Decimal::from_str("0.01").unwrap()),
                     neg_risk: Some(true),
+                    force_tick_size: false,
                 },
             )
             .unwrap();

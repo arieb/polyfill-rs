@@ -932,12 +932,19 @@ impl ClobClient {
         token_id: &str,
         options: Option<&CreateOrderOptions>,
     ) -> Result<CreateOrderOptions> {
-        let (tick_size, neg_risk) = match options {
-            Some(o) => (o.tick_size, o.neg_risk),
-            None => (None, None),
+        let (tick_size, neg_risk, force_tick_size) = match options {
+            Some(o) => (o.tick_size, o.neg_risk, o.force_tick_size),
+            None => (None, None, false),
         };
 
-        let tick_size = self.resolve_tick_size(token_id, tick_size).await?;
+        let tick_size = if force_tick_size {
+            match tick_size {
+                Some(t) => t,
+                None => self.get_tick_size(token_id).await?,
+            }
+        } else {
+            self.resolve_tick_size(token_id, tick_size).await?
+        };
         let neg_risk = match neg_risk {
             Some(nr) => nr,
             None => self.get_neg_risk(token_id).await?,
@@ -946,6 +953,7 @@ impl ClobClient {
         Ok(CreateOrderOptions {
             tick_size: Some(tick_size),
             neg_risk: Some(neg_risk),
+            force_tick_size: false,
         })
     }
 
